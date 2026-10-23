@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
+import Icon from './Icon'
+import VoicePlayer from './VoicePlayer'
 
 const sizeText = (b) =>
   b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round((b || 0) / 1024)) + ' KB'
@@ -28,12 +30,12 @@ export default function Attachment({ m }) {
         <img className="att-img" src={url} alt={m.file_name} />
       </a>
     )
-  if (type.startsWith('audio/')) return <audio className="att-audio" controls preload="metadata" src={url} />
+  if (type.startsWith('audio/')) return <VoicePlayer src={url} seed={m.id} duration={m.duration} />
   if (type.startsWith('video/')) return <video className="att-video" controls preload="metadata" src={url} />
 
   return (
     <a className="att-file" href={url} download={m.file_name}>
-      <span style={{ fontSize: 24 }}>📄</span>
+      <Icon name="file" size={30} />
       <span>
         {m.file_name}
         <small>{sizeText(m.file_size)}</small>

@@ -4,7 +4,10 @@ import Attachment from './Attachment'
 import CallScreen from './CallScreen'
 import Avatar from './Avatar'
 import Settings from './Settings'
+import ProfileView from './ProfileView'
+import Icon from './Icon'
 import { useCall } from './useCall'
+import { getTheme, applyTheme } from './theme'
 
 const MAX_SIZE = 25 * 1024 * 1024
 
@@ -25,10 +28,17 @@ function lastSeenText(ts) {
 function preview(m) {
   if (!m.file_path) return m.content
   const t = m.file_type || ''
-  if (t.startsWith('audio/')) return '🎤 Voice message'
-  if (t.startsWith('image/')) return '📷 Photo'
-  if (t.startsWith('video/')) return '🎥 Video'
-  return '📎 ' + m.file_name
+  let icon = 'file'
+  let label = m.file_name
+  if (t.startsWith('audio/')) { icon = 'mic'; label = 'Voice message' }
+  else if (t.startsWith('image/')) { icon = 'image'; label = 'Photo' }
+  else if (t.startsWith('video/')) { icon = 'video'; label = 'Video' }
+  return (
+    <span className="pv">
+      <Icon name={icon} size={14} />
+      {label}
+    </span>
+  )
 }
 
 const nameOf = (p) => p?.display_name || p?.username || ''
@@ -46,16 +56,25 @@ export default function ChatScreen({ session }) {
   const [online, setOnline] = useState(new Set())
   const [recording, setRecording] = useState(false)
   const [secs, setSecs] = useState(0)
-  const [uploading, setUploading] = useState(false)
+  const [pending, setPending] = useState(null)
   const [showSettings, setShowSettings] = useState(false)
+  const [showProfile, setShowProfile] = useState(false)
+  const [theme, setTheme] = useState(getTheme())
 
   const prevOnline = useRef(new Set())
   const recRef = useRef(null)
   const fileRef = useRef(null)
   const bottomRef = useRef(null)
 
+  const uploading = !!pending
   const myName = nameOf(me) || session.user.user_metadata?.username || 'someone'
   const { call, localStream, remoteStream, startCall, acceptCall, hangup } = useCall(myId, myName)
+
+  function toggleTheme() {
+    const next = theme === 'dark' ? 'light' : 'dark'
+    applyTheme(next)
+    setTheme(next)
+  }
 
   function addProfiles(list) {
     setProfiles((p) => {
@@ -174,7 +193,7 @@ export default function ChatScreen({ session }) {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [chatMessages.length, active])
+  }, [chatMessages.length, active, pending])
 
   function openChat(user) {
     addProfiles([user])
@@ -201,41 +220,44 @@ export default function ChatScreen({ session }) {
   }
 
   // upload a file or voice note, then send it as a message
-  async function uploadAndSend(file, name, type, to) {
+  async function uploadAndSend(file, name, type, to, duration) {
     if (!to) return
     if (file.size > MAX_SIZE) {
       alert('File is too big. Maximum is 25 MB.')
       return
     }
-    setUploading(true)
-    const safe = name.replace(/[^a-zA-Z0-9._-]/g, '_')
-    const path = `${myId}/${Date.now()}-${safe}`
-    const { error: upErr } = await supabase.storage
-      .from('chat-files')
-      .upload(path, file, { contentType: type })
-    if (upErr) {
-      alert(upErr.message)
-      setUploading(false)
-      return
+    setPending({ to, name, voice: type.startsWith('audio/') && name.startsWith('voice-') })
+    try {
+      const safe = name.replace(/[^a-zA-Z0-9._-]/g, '_')
+      const path = `${myId}/${Date.now()}-${safe}`
+      const { error: upErr } = await supabase.storage
+        .from('chat-files')
+        .upload(path, file, { contentType: type })
+      if (upErr) {
+        alert(upErr.message)
+        return
+      }
+      const { data, error } = await supabase
+        .from('messages')
+        .insert({
+          receiver_id: to,
+          content: '',
+          file_path: path,
+          file_name: name,
+          file_type: type,
+          file_size: file.size,
+          duration: duration || null,
+        })
+        .select()
+        .single()
+      if (error) {
+        alert(error.message)
+        return
+      }
+      setMessages((prev) => (prev.some((x) => x.id === data.id) ? prev : [...prev, data]))
+    } finally {
+      setPending(null)
     }
-    const { data, error } = await supabase
-      .from('messages')
-      .insert({
-        receiver_id: to,
-        content: '',
-        file_path: path,
-        file_name: name,
-        file_type: type,
-        file_size: file.size,
-      })
-      .select()
-      .single()
-    setUploading(false)
-    if (error) {
-      alert(error.message)
-      return
-    }
-    setMessages((prev) => (prev.some((x) => x.id === data.id) ? prev : [...prev, data]))
   }
 
   function onPickFile(e) {
@@ -256,7 +278,7 @@ export default function ChatScreen({ session }) {
       const mime =
         ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((t) => MediaRecorder.isTypeSupported(t)) || ''
       const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
-      const r = { recorder, chunks: [], cancelled: false, timer: null }
+      const r = { recorder, chunks: [], cancelled: false, timer: null, start: Date.now() }
 
       recorder.ondataavailable = (e) => {
         if (e.data.size) r.chunks.push(e.data)
@@ -270,7 +292,8 @@ export default function ChatScreen({ session }) {
         const ext = type.includes('mp4') ? 'm4a' : 'webm'
         const blob = new Blob(r.chunks, { type })
         if (!blob.size) return
-        uploadAndSend(blob, `voice-${Date.now()}.${ext}`, type, to)
+        const dur = Math.max(1, Math.round((Date.now() - r.start) / 1000))
+        uploadAndSend(blob, `voice-${Date.now()}.${ext}`, type, to, dur)
       }
 
       recorder.start()
@@ -319,8 +342,15 @@ export default function ChatScreen({ session }) {
             <Avatar profile={me} />
           </div>
           <b>{nameOf(me)}</b>
-          <button className="icon-btn" title="Settings" onClick={() => setShowSettings(true)}>⚙️</button>
-          <button onClick={() => supabase.auth.signOut()}>Log out</button>
+          <button className="icon-btn" title={theme === 'dark' ? 'Light mode' : 'Dark mode'} onClick={toggleTheme}>
+            <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={21} />
+          </button>
+          <button className="icon-btn" title="Settings" onClick={() => setShowSettings(true)}>
+            <Icon name="settings" size={21} />
+          </button>
+          <button className="icon-btn" title="Log out" onClick={() => supabase.auth.signOut()}>
+            <Icon name="logout" size={21} />
+          </button>
         </header>
 
         <div className="search">
@@ -368,14 +398,22 @@ export default function ChatScreen({ session }) {
         {active ? (
           <>
             <header className="bar">
-              <button className="back" onClick={() => setActive(null)}>←</button>
-              <Avatar profile={profiles[active]} online={showOnline(active)} />
-              <div className="who">
-                <b>{activeName}</b>
-                <small>{statusText}</small>
+              <button className="back" onClick={() => setActive(null)}>
+                <Icon name="back" size={22} />
+              </button>
+              <div className="head-click" title="View contact info" onClick={() => setShowProfile(true)}>
+                <Avatar profile={profiles[active]} online={showOnline(active)} />
+                <div className="who">
+                  <b>{activeName}</b>
+                  <small>{statusText}</small>
+                </div>
               </div>
-              <button className="icon-btn" title="Voice call" onClick={() => callPeer(false)}>📞</button>
-              <button className="icon-btn" title="Video call" onClick={() => callPeer(true)}>🎥</button>
+              <button className="icon-btn" title="Video call" onClick={() => callPeer(true)}>
+                <Icon name="video" size={22} />
+              </button>
+              <button className="icon-btn" title="Voice call" onClick={() => callPeer(false)}>
+                <Icon name="phone" size={20} />
+              </button>
             </header>
 
             <div className="messages">
@@ -386,26 +424,47 @@ export default function ChatScreen({ session }) {
                   <span className="t">{fmt(m.created_at)}</span>
                 </div>
               ))}
+              {pending && pending.to === active && (
+                <div className="bubble me sending">
+                  <span className="dots"><i /><i /><i /></span>
+                  {pending.voice ? 'Sending voice message' : 'Sending ' + pending.name}
+                </div>
+              )}
               <div ref={bottomRef} />
             </div>
 
             {recording ? (
               <div className="composer">
-                <button type="button" className="gray" onClick={() => stopRec(true)}>🗑</button>
-                <div className="rec"><span className="rec-dot" /> Recording {mmss(secs)}</div>
-                <button type="button" onClick={() => stopRec(false)}>➤</button>
+                <button type="button" className="gray" title="Cancel" onClick={() => stopRec(true)}>
+                  <Icon name="trash" size={20} />
+                </button>
+                <div className="rec">
+                  <span className="rec-dot" />
+                  <span className="rec-bars"><i /><i /><i /><i /><i /></span>
+                  {mmss(secs)}
+                </div>
+                <button type="button" title="Send" onClick={() => stopRec(false)}>
+                  <Icon name="send" size={20} />
+                </button>
               </div>
             ) : (
               <form className="composer" onSubmit={send}>
-                <button type="button" className="gray" disabled={uploading}
-                        onClick={() => fileRef.current.click()}>📎</button>
+                <button type="button" className="gray" title="Attach file" disabled={uploading}
+                        onClick={() => fileRef.current.click()}>
+                  <Icon name="paperclip" size={20} />
+                </button>
                 <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={onPickFile} />
                 <input value={text} onChange={(e) => setText(e.target.value)}
-                       placeholder={uploading ? 'Uploading...' : 'Type a message'} />
+                       placeholder={uploading ? 'Sending...' : 'Type a message'} />
                 {text.trim() ? (
-                  <button type="submit">➤</button>
+                  <button key="send" type="submit" className="swap" title="Send">
+                    <Icon name="send" size={20} />
+                  </button>
                 ) : (
-                  <button type="button" disabled={uploading} onClick={startRec}>🎤</button>
+                  <button key="mic" type="button" className="swap" title="Record voice message"
+                          disabled={uploading} onClick={startRec}>
+                    <Icon name="mic" size={20} />
+                  </button>
                 )}
               </form>
             )}
@@ -423,6 +482,10 @@ export default function ChatScreen({ session }) {
 
       {showSettings && me && (
         <Settings me={me} onClose={() => setShowSettings(false)} onSaved={(p) => setMe(p)} />
+      )}
+
+      {showProfile && active && profiles[active] && (
+        <ProfileView profile={profiles[active]} status={statusText} onClose={() => setShowProfile(false)} />
       )}
     </div>
   )

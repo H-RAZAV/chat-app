@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { supabase } from './supabaseClient'
 import Avatar from './Avatar'
+   import Icon from './Icon'
 
 // crop to a square and shrink the photo so it loads fast
 function resizeImage(file, size) {
@@ -134,7 +135,7 @@ export default function Settings({ me, onClose, onSaved }) {
       <div className="panel" onClick={(e) => e.stopPropagation()}>
         <div className="panel-head">
           <h3>Settings</h3>
-          <button onClick={onClose}>✕</button>
+             <button onClick={onClose} title="Close"><Icon name="close" size={22} /></button>
         </div>
 
         <div className="panel-body">

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import Icon from './Icon'
 
 const TEXT = { calling: 'Calling...', connecting: 'Connecting...', connected: 'Connected' }
 
@@ -55,16 +56,26 @@ export default function CallScreen({ call, localStream, remoteStream, onAccept, 
       <div className="call-actions">
         {call.status === 'incoming' ? (
           <>
-            <button className="call-btn red" onClick={onHangup}>✖</button>
-            <button className="call-btn green" onClick={onAccept}>📞</button>
+            <button className="call-btn red" title="Decline" onClick={onHangup}>
+              <Icon name="phone" size={26} style={{ transform: 'rotate(135deg)' }} />
+            </button>
+            <button className="call-btn green" title="Accept" onClick={onAccept}>
+              <Icon name={call.video ? 'video' : 'phone'} size={26} />
+            </button>
           </>
         ) : (
           <>
-            <button className={'call-btn' + (mic ? '' : ' off')} onClick={toggleMic}>{mic ? '🎤' : '🔇'}</button>
+            <button className={'call-btn' + (mic ? '' : ' off')} title="Mute" onClick={toggleMic}>
+              <Icon name={mic ? 'mic' : 'micOff'} size={26} />
+            </button>
             {call.video && (
-              <button className={'call-btn' + (cam ? '' : ' off')} onClick={toggleCam}>{cam ? '📷' : '🚫'}</button>
+              <button className={'call-btn' + (cam ? '' : ' off')} title="Camera" onClick={toggleCam}>
+                <Icon name={cam ? 'video' : 'videoOff'} size={26} />
+              </button>
             )}
-            <button className="call-btn red" onClick={onHangup}>✖</button>
+            <button className="call-btn red" title="End call" onClick={onHangup}>
+              <Icon name="phone" size={26} style={{ transform: 'rotate(135deg)' }} />
+            </button>
           </>
         )}
       </div>

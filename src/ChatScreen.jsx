@@ -7,7 +7,9 @@ import Settings from './Settings'
 import ProfileView from './ProfileView'
 import Icon from './Icon'
 import { useCall } from './useCall'
+import { useActivity } from './useActivity'
 import { getTheme, applyTheme } from './theme'
+import { playPing, unlockAudio, setBadge, showNotification } from './notify'
 
 const MAX_SIZE = 25 * 1024 * 1024
 
@@ -25,23 +27,32 @@ function lastSeenText(ts) {
   return 'last seen ' + d.toLocaleDateString() + ' at ' + fmt(ts)
 }
 
+function previewText(m) {
+  if (!m.file_path) return m.content
+  const t = m.file_type || ''
+  if (t.startsWith('audio/')) return 'Voice message'
+  if (t.startsWith('image/')) return 'Photo'
+  if (t.startsWith('video/')) return 'Video'
+  return m.file_name
+}
+
 function preview(m) {
   if (!m.file_path) return m.content
   const t = m.file_type || ''
   let icon = 'file'
-  let label = m.file_name
-  if (t.startsWith('audio/')) { icon = 'mic'; label = 'Voice message' }
-  else if (t.startsWith('image/')) { icon = 'image'; label = 'Photo' }
-  else if (t.startsWith('video/')) { icon = 'video'; label = 'Video' }
+  if (t.startsWith('audio/')) icon = 'mic'
+  else if (t.startsWith('image/')) icon = 'image'
+  else if (t.startsWith('video/')) icon = 'video'
   return (
     <span className="pv">
       <Icon name={icon} size={14} />
-      {label}
+      {previewText(m)}
     </span>
   )
 }
 
 const nameOf = (p) => p?.display_name || p?.username || ''
+const actText = (k) => (k === 'recording' ? 'recording audio...' : 'typing...')
 const mmss = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0')
 
 export default function ChatScreen({ session }) {
@@ -60,15 +71,20 @@ export default function ChatScreen({ session }) {
   const [showSettings, setShowSettings] = useState(false)
   const [showProfile, setShowProfile] = useState(false)
   const [theme, setTheme] = useState(getTheme())
+  const [visible, setVisible] = useState(document.visibilityState === 'visible')
+  const [perm, setPerm] = useState('Notification' in window ? Notification.permission : 'unsupported')
 
   const prevOnline = useRef(new Set())
   const recRef = useRef(null)
   const fileRef = useRef(null)
   const bottomRef = useRef(null)
+  const activeRef = useRef(null)
+  activeRef.current = active
 
   const uploading = !!pending
   const myName = nameOf(me) || session.user.user_metadata?.username || 'someone'
   const { call, localStream, remoteStream, startCall, acceptCall, hangup } = useCall(myId, myName)
+  const { activity, sendActivity, clearActivity } = useActivity(myId)
 
   function toggleTheme() {
     const next = theme === 'dark' ? 'light' : 'dark'
@@ -84,23 +100,25 @@ export default function ChatScreen({ session }) {
     })
   }
 
+  async function fetchMessages() {
+    const { data: msgs } = await supabase
+      .from('messages').select('*')
+      .order('created_at', { ascending: false }).limit(1000)
+    const list = (msgs || []).reverse()
+    setMessages(list)
+    const ids = [...new Set(list.map((m) => (m.sender_id === myId ? m.receiver_id : m.sender_id)))]
+    if (ids.length) {
+      const { data: ps } = await supabase.from('profiles').select('*').in('id', ids)
+      addProfiles(ps || [])
+    }
+  }
+
   // load my profile + messages, then listen for new messages
   useEffect(() => {
     async function load() {
       const { data: mine } = await supabase.from('profiles').select('*').eq('id', myId).single()
       setMe(mine)
-
-      const { data: msgs } = await supabase
-        .from('messages').select('*')
-        .order('created_at', { ascending: false }).limit(1000)
-      const list = (msgs || []).reverse()
-      setMessages(list)
-
-      const ids = [...new Set(list.map((m) => (m.sender_id === myId ? m.receiver_id : m.sender_id)))]
-      if (ids.length) {
-        const { data: ps } = await supabase.from('profiles').select('*').in('id', ids)
-        addProfiles(ps || [])
-      }
+      await fetchMessages()
     }
     load()
 
@@ -109,14 +127,95 @@ export default function ChatScreen({ session }) {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
         const m = payload.new
         setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
-        const otherId = m.sender_id === myId ? m.receiver_id : m.sender_id
+
+        const incoming = m.receiver_id === myId
+        const screenHidden = document.visibilityState !== 'visible'
+        const viewing = !screenHidden && activeRef.current === m.sender_id
+        if (incoming) {
+          clearActivity(m.sender_id)
+          if (!viewing) playPing()
+        }
+
+        const otherId = incoming ? m.sender_id : m.receiver_id
         const { data } = await supabase.from('profiles').select('*').eq('id', otherId).single()
         if (data) addProfiles([data])
+
+        if (incoming && screenHidden) {
+          showNotification(nameOf(data) || 'New message', previewText(m), 'msg-' + m.sender_id, {
+            from: m.sender_id,
+          })
+        }
       })
       .subscribe()
 
-    return () => supabase.removeChannel(channel)
+    // when the app comes back to the screen or the internet returns, catch up on missed messages
+    const onVis = () => {
+      const v = document.visibilityState === 'visible'
+      setVisible(v)
+      if (v) fetchMessages()
+    }
+    const onNet = () => fetchMessages()
+    document.addEventListener('visibilitychange', onVis)
+    window.addEventListener('online', onNet)
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVis)
+      window.removeEventListener('online', onNet)
+      supabase.removeChannel(channel)
+    }
   }, [myId])
+
+  // sound needs one tap on the page before browsers allow it
+  useEffect(() => {
+    window.addEventListener('pointerdown', unlockAudio, { once: true })
+    return () => window.removeEventListener('pointerdown', unlockAudio)
+  }, [])
+
+  // open a chat when someone taps a notification
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const fromUrl = params.get('chat')
+    if (fromUrl) {
+      setActive(fromUrl)
+      window.history.replaceState({}, '', '/')
+    }
+    const onMsg = (e) => {
+      if (e.data?.type === 'open-chat' && e.data.id) setActive(e.data.id)
+    }
+    navigator.serviceWorker?.addEventListener('message', onMsg)
+    return () => navigator.serviceWorker?.removeEventListener('message', onMsg)
+  }, [])
+
+  // unread counts per person
+  const unread = useMemo(() => {
+    const c = {}
+    messages.forEach((m) => {
+      if (m.receiver_id === myId && !m.read_at) c[m.sender_id] = (c[m.sender_id] || 0) + 1
+    })
+    return c
+  }, [messages, myId])
+  const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0)
+  const activeUnread = unread[active] || 0
+
+  // tab title and app icon badge
+  useEffect(() => {
+    document.title = totalUnread ? `(${totalUnread}) Chat App` : 'Chat App'
+    setBadge(totalUnread)
+  }, [totalUnread])
+
+  // messages in the open chat count as read while the app is on screen
+  useEffect(() => {
+    if (!active || !visible || !activeUnread) return
+    supabase.rpc('mark_read', { other: active }).then(({ error }) => {
+      if (error) return
+      const now = new Date().toISOString()
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.sender_id === active && m.receiver_id === myId && !m.read_at ? { ...m, read_at: now } : m
+        )
+      )
+    })
+  }, [active, visible, activeUnread, myId])
 
   // online status (presence) + last seen
   useEffect(() => {
@@ -201,11 +300,18 @@ export default function ChatScreen({ session }) {
     setQuery('')
   }
 
+  function onType(e) {
+    const v = e.target.value
+    setText(v)
+    if (active) sendActivity(active, v.trim() ? 'typing' : 'none')
+  }
+
   async function send(e) {
     e.preventDefault()
     const content = text.trim()
     if (!content || !active) return
     setText('')
+    sendActivity(active, 'none')
     const { data, error } = await supabase
       .from('messages')
       .insert({ receiver_id: active, content })
@@ -278,7 +384,7 @@ export default function ChatScreen({ session }) {
       const mime =
         ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((t) => MediaRecorder.isTypeSupported(t)) || ''
       const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
-      const r = { recorder, chunks: [], cancelled: false, timer: null, start: Date.now() }
+      const r = { recorder, chunks: [], cancelled: false, timer: null, act: null, start: Date.now() }
 
       recorder.ondataavailable = (e) => {
         if (e.data.size) r.chunks.push(e.data)
@@ -286,6 +392,8 @@ export default function ChatScreen({ session }) {
       recorder.onstop = () => {
         stream.getTracks().forEach((t) => t.stop())
         clearInterval(r.timer)
+        clearInterval(r.act)
+        sendActivity(to, 'none')
         setRecording(false)
         if (r.cancelled) return
         const type = (recorder.mimeType || 'audio/webm').split(';')[0]
@@ -299,6 +407,8 @@ export default function ChatScreen({ session }) {
       recorder.start()
       setSecs(0)
       r.timer = setInterval(() => setSecs((s) => s + 1), 1000)
+      sendActivity(to, 'recording')
+      r.act = setInterval(() => sendActivity(to, 'recording'), 2000)
       recRef.current = r
       setRecording(true)
     } catch {
@@ -332,6 +442,7 @@ export default function ChatScreen({ session }) {
     : online.has(active)
     ? 'online'
     : lastSeenText(profiles[active]?.last_seen)
+  const act = activity[active]
 
   return (
     <div className={'app' + (active ? ' chat-open' : '')}>
@@ -352,6 +463,13 @@ export default function ChatScreen({ session }) {
             <Icon name="logout" size={21} />
           </button>
         </header>
+
+        {perm === 'default' && (
+          <div className="notice">
+            <span>Get alerts for new messages</span>
+            <button onClick={() => Notification.requestPermission().then(setPerm)}>Turn on</button>
+          </div>
+        )}
 
         <div className="search">
           <input placeholder="Search username to start a chat"
@@ -381,9 +499,21 @@ export default function ChatScreen({ session }) {
                 <div className="meta">
                   <div className="top">
                     <span className="name">{nameOf(profiles[id]) || '...'}</span>
-                    <span className="time">{fmt(last.created_at)}</span>
+                    <span className={'time' + (unread[id] ? ' new' : '')}>{fmt(last.created_at)}</span>
                   </div>
-                  <div className="last">{last.sender_id === myId ? 'You: ' : ''}{preview(last)}</div>
+                  <div className="row2">
+                    <div className={'last' + (activity[id] ? ' act' : '')}>
+                      {activity[id] ? (
+                        actText(activity[id])
+                      ) : (
+                        <>
+                          {last.sender_id === myId ? 'You: ' : ''}
+                          {preview(last)}
+                        </>
+                      )}
+                    </div>
+                    {unread[id] > 0 && <span className="badge">{unread[id] > 99 ? '99+' : unread[id]}</span>}
+                  </div>
                 </div>
               </div>
             ))
@@ -405,7 +535,7 @@ export default function ChatScreen({ session }) {
                 <Avatar profile={profiles[active]} online={showOnline(active)} />
                 <div className="who">
                   <b>{activeName}</b>
-                  <small>{statusText}</small>
+                  <small className={act ? 'act' : ''}>{act ? actText(act) : statusText}</small>
                 </div>
               </div>
               <button className="icon-btn" title="Video call" onClick={() => callPeer(true)}>
@@ -454,7 +584,7 @@ export default function ChatScreen({ session }) {
                   <Icon name="paperclip" size={20} />
                 </button>
                 <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={onPickFile} />
-                <input value={text} onChange={(e) => setText(e.target.value)}
+                <input value={text} onChange={onType}
                        placeholder={uploading ? 'Sending...' : 'Type a message'} />
                 {text.trim() ? (
                   <button key="send" type="submit" className="swap" title="Send">

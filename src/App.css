@@ -173,3 +173,13 @@
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+/* ---------- Unread, typing, notices ---------- */
+body { overscroll-behavior: none; }
+.row2 { display: flex; align-items: center; gap: 8px; }
+.row2 .last { flex: 1; min-width: 0; }
+.item .time.new { color: var(--accent); font-weight: 600; }
+.badge { background: var(--accent); color: #fff; font-size: 12px; font-weight: 700; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; animation: pop .18s ease-out; }
+.item .last.act { color: var(--accent); font-weight: 600; }
+.bar .who small.act { color: #b7f5c9; font-weight: 600; opacity: 1; }
+.notice { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; background: var(--bg-hover); border-bottom: 1px solid var(--border); font-size: 14px; color: var(--text); }
+.notice button { background: var(--accent-2); color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; font-size: 13px; white-space: nowrap; }

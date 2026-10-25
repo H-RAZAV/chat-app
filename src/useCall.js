@@ -1,11 +1,57 @@
 import { useEffect, useRef, useState } from 'react'
 import { supabase } from './supabaseClient'
 
-const ICE = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
+const STUN = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+]
+
+// accepts "name", "name.metered.live" or "https://name.metered.live/"
+function meteredHost() {
+  let app = (import.meta.env.VITE_METERED_APP || '').trim()
+  app = app.replace(/^https?:\/\//, '').replace(/\/+$/, '')
+  if (app && !app.includes('.')) app += '.metered.live'
+  return app
+}
+
+// ask Metered for relay (TURN) servers
+async function getIce() {
+  const host = meteredHost()
+  const key = (import.meta.env.VITE_METERED_KEY || '').trim()
+  const config = { iceServers: STUN }
+  // test mode: open the site with ?relay=1 to force every call through the relay
+  if (new URLSearchParams(window.location.search).has('relay')) config.iceTransportPolicy = 'relay'
+
+  let relayCount = 0
+  let problem = ''
+  if (!host || !key) {
+    problem = 'missing'
+  } else {
+    try {
+      const res = await fetch(`https://${host}/api/v1/turn/credentials?apiKey=${key}`)
+      const list = await res.json()
+      if (Array.isArray(list) && list.length) {
+        config.iceServers = [...STUN, ...list]
+        relayCount = list.length
+      } else {
+        problem = 'rejected'
+      }
+    } catch {
+      problem = 'unreachable'
+    }
+  }
+  console.log('[call] relay servers loaded:', relayCount, problem)
+  return { config, relayCount, problem }
+}
+
+function failText(ice) {
+  if (ice?.problem === 'missing')
+    return 'Call failed: the relay server is not set up. VITE_METERED_APP or VITE_METERED_KEY is missing in this version of the app.'
+  if (ice?.problem === 'rejected')
+    return 'Call failed: Metered refused the request. Check the app name and the API key.'
+  if (ice?.problem === 'unreachable')
+    return 'Call failed: could not reach the Metered relay server. Check the app name and your internet.'
+  return 'Call failed even with the relay server. Check that your Metered account is active and still has free data left.'
 }
 
 export function useCall(myId, myName) {
@@ -18,8 +64,12 @@ export function useCall(myId, myName) {
   const local = useRef(null)
   const pendingOffer = useRef(null)
   const pendingIce = useRef([])
+  const earlyIce = useRef({})
+  const flushLocal = useRef(() => {})
+  const iceInfo = useRef(null)
   const sendChans = useRef({})
   const ringTimer = useRef(null)
+  const connectTimer = useRef(null)
 
   function updateCall(c) {
     callRef.current = c
@@ -47,8 +97,10 @@ export function useCall(myId, myName) {
 
   function cleanup() {
     clearTimeout(ringTimer.current)
+    clearTimeout(connectTimer.current)
     if (pc.current) {
       pc.current.onconnectionstatechange = null
+      pc.current.oniceconnectionstatechange = null
       pc.current.close()
       pc.current = null
     }
@@ -56,6 +108,8 @@ export function useCall(myId, myName) {
     local.current = null
     pendingOffer.current = null
     pendingIce.current = []
+    earlyIce.current = {}
+    flushLocal.current = () => {}
     setLocalStream(null)
     setRemoteStream(null)
     updateCall(null)
@@ -67,24 +121,52 @@ export function useCall(myId, myName) {
     cleanup()
   }
 
+  function fail() {
+    if (!callRef.current) return
+    alert(failText(iceInfo.current))
+    hangup()
+  }
+
+  // give up if the call has not connected 25 seconds after the answer
+  function armConnectTimer() {
+    clearTimeout(connectTimer.current)
+    connectTimer.current = setTimeout(() => {
+      if (callRef.current && callRef.current.status !== 'connected') fail()
+    }, 25000)
+  }
+
   function flushIce() {
     pendingIce.current.forEach((c) => pc.current?.addIceCandidate(c).catch(() => {}))
     pendingIce.current = []
   }
 
-  function createPeer(peerId) {
-    const p = new RTCPeerConnection(ICE)
+  function createPeer(peerId, ice) {
+    const p = new RTCPeerConnection(ice.config)
+
+    // our own network details wait until the offer/answer has been sent first
+    let ready = false
+    const queue = []
     p.onicecandidate = (e) => {
-      if (e.candidate) signal(peerId, { type: 'ice', candidate: e.candidate.toJSON() })
+      if (!e.candidate) return
+      const c = e.candidate.toJSON()
+      if (ready) signal(peerId, { type: 'ice', candidate: c })
+      else queue.push(c)
     }
+    flushLocal.current = () => {
+      ready = true
+      queue.splice(0).forEach((c) => signal(peerId, { type: 'ice', candidate: c }))
+    }
+
     p.ontrack = (e) => setRemoteStream(e.streams[0])
+    p.oniceconnectionstatechange = () => console.log('[call] ice:', p.iceConnectionState)
     p.onconnectionstatechange = () => {
+      console.log('[call] connection:', p.connectionState)
       if (p.connectionState === 'connected') {
         clearTimeout(ringTimer.current)
+        clearTimeout(connectTimer.current)
         if (callRef.current) updateCall({ ...callRef.current, status: 'connected' })
       } else if (p.connectionState === 'failed') {
-        alert('The call could not connect. Your networks may be blocking direct calls.')
-        hangup()
+        fail()
       }
     }
     local.current.getTracks().forEach((t) => p.addTrack(t, local.current))
@@ -112,7 +194,10 @@ export function useCall(myId, myName) {
     }
     local.current = stream
     setLocalStream(stream)
-    const p = createPeer(peer.id)
+    const ice = await getIce()
+    iceInfo.current = ice
+    if (!callRef.current) return
+    const p = createPeer(peer.id, ice)
     const offer = await p.createOffer()
     await p.setLocalDescription(offer)
     signal(peer.id, {
@@ -121,6 +206,7 @@ export function useCall(myId, myName) {
       video,
       sdp: { type: offer.type, sdp: offer.sdp },
     })
+    flushLocal.current()
     ringTimer.current = setTimeout(() => {
       if (callRef.current?.status === 'calling') {
         alert('No answer.')
@@ -146,12 +232,17 @@ export function useCall(myId, myName) {
     }
     local.current = stream
     setLocalStream(stream)
-    const p = createPeer(offer.from)
+    const ice = await getIce()
+    iceInfo.current = ice
+    if (!callRef.current) return
+    const p = createPeer(offer.from, ice)
     await p.setRemoteDescription(offer.sdp)
     flushIce()
     const answer = await p.createAnswer()
     await p.setLocalDescription(answer)
     signal(offer.from, { type: 'answer', sdp: { type: answer.type, sdp: answer.sdp } })
+    flushLocal.current()
+    armConnectTimer()
   }
 
   async function onSignal(s) {
@@ -159,13 +250,20 @@ export function useCall(myId, myName) {
     if (s.type === 'offer') {
       if (c) return signal(s.from, { type: 'busy' })
       pendingOffer.current = s
-      pendingIce.current = []
+      pendingIce.current = earlyIce.current[s.from] || []
+      delete earlyIce.current[s.from]
       updateCall({ peerId: s.from, peerName: s.fromName, video: s.video, status: 'incoming' })
       ringTimer.current = setTimeout(() => {
         if (callRef.current?.status === 'incoming') cleanup()
       }, 60000)
     } else if (s.type === 'ice') {
-      if (!c || c.peerId !== s.from) return
+      if (!c) {
+        // arrived before the offer: keep it for later
+        if (!earlyIce.current[s.from]) earlyIce.current[s.from] = []
+        earlyIce.current[s.from].push(s.candidate)
+        return
+      }
+      if (c.peerId !== s.from) return
       if (pc.current?.remoteDescription) pc.current.addIceCandidate(s.candidate).catch(() => {})
       else pendingIce.current.push(s.candidate)
     } else if (s.type === 'answer') {
@@ -174,6 +272,7 @@ export function useCall(myId, myName) {
       updateCall({ ...c, status: 'connecting' })
       await pc.current.setRemoteDescription(s.sdp)
       flushIce()
+      armConnectTimer()
     } else if (s.type === 'hangup' || s.type === 'reject' || s.type === 'busy') {
       if (c && c.peerId === s.from) {
         cleanup()

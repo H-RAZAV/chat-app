@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import Login from './Login'
-import ChatScreen from './ChatScreen'
+import KeyGate from './KeyGate'
 import './App.css'
 
 export default function App() {
@@ -18,5 +18,5 @@ export default function App() {
   }, [])
 
   if (loading) return <p style={{ padding: 20 }}>Loading...</p>
-  return session ? <ChatScreen session={session} /> : <Login />
+  return session ? <KeyGate session={session} /> : <Login />
 }

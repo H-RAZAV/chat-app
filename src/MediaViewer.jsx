@@ -11,12 +11,12 @@ export default function MediaViewer({ items, index, onIndex, onClose, titleOf })
   useEffect(() => {
     let off = false
     setUrl(null)
-    getUrl(m.file_path).then((u) => {
+    getUrl(m).then((u) => {
       if (!off) setUrl(u)
     })
     // get the next and previous ones ready
-    if (items[index - 1]) getUrl(items[index - 1].file_path)
-    if (items[index + 1]) getUrl(items[index + 1].file_path)
+    if (items[index - 1]) getUrl(items[index - 1])
+    if (items[index + 1]) getUrl(items[index + 1])
     return () => { off = true }
   }, [m.file_path])
 
@@ -51,7 +51,7 @@ export default function MediaViewer({ items, index, onIndex, onClose, titleOf })
           <b>{titleOf(m)}</b>
           <small>{new Date(m.created_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</small>
         </div>
-        <button title="Download" onClick={() => downloadFile(m.file_path, m.file_name)}>
+        <button title="Download" onClick={() => downloadFile(m)}>
           <Icon name="download" size={22} />
         </button>
       </div>

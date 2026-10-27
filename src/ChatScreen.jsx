@@ -11,8 +11,9 @@ import { useCall } from './useCall'
 import { useActivity } from './useActivity'
 import { getTheme, applyTheme } from './theme'
 import { playPing, unlockAudio, setBadge, showNotification } from './notify'
+import { derivePairKey, sealJson, openJson, sealBytes, clearKey } from './crypto'
 
-const MAX_SIZE = 25 * 1024 * 1024
+const MAX_SIZE = 25 * 1024 * 1024 - 1024 // a little room for the encryption overhead
 
 const fmt = (ts) =>
   new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -29,6 +30,7 @@ function lastSeenText(ts) {
 }
 
 function previewText(m) {
+  if (m.locked) return "Message can't be decrypted"
   if (!m.file_path) return m.content
   const t = m.file_type || ''
   if (t.startsWith('audio/')) return 'Voice message'
@@ -38,6 +40,14 @@ function previewText(m) {
 }
 
 function preview(m) {
+  if (m.locked) {
+    return (
+      <span className="pv">
+        <Icon name="lock" size={14} />
+        {previewText(m)}
+      </span>
+    )
+  }
   if (!m.file_path) return m.content
   const t = m.file_type || ''
   let icon = 'file'
@@ -66,7 +76,7 @@ const nameOf = (p) => p?.display_name || p?.username || ''
 const actText = (k) => (k === 'recording' ? 'recording audio...' : 'typing...')
 const mmss = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0')
 
-export default function ChatScreen({ session }) {
+export default function ChatScreen({ session, keys }) {
   const myId = session.user.id
   const [me, setMe] = useState(null)
   const [messages, setMessages] = useState([])
@@ -92,6 +102,9 @@ export default function ChatScreen({ session }) {
   const bottomRef = useRef(null)
   const activeRef = useRef(null)
   activeRef.current = active
+  const profilesRef = useRef({})
+  profilesRef.current = profiles
+  const pairKeys = useRef({})
 
   const uploading = !!pending
   const myName = nameOf(me) || session.user.user_metadata?.username || 'someone'
@@ -107,12 +120,75 @@ export default function ChatScreen({ session }) {
     setTheme(next)
   }
 
+  async function logout() {
+    try {
+      await clearKey(myId) // the key is removed from this device
+    } catch {
+      /* ignore */
+    }
+    supabase.auth.signOut()
+  }
+
   function addProfiles(list) {
     setProfiles((p) => {
       const n = { ...p }
       list.forEach((x) => (n[x.id] = x))
       return n
     })
+  }
+
+  // ---------- encryption ----------
+  function getPairKey(profile) {
+    const pub = profile?.public_key
+    if (!pub) return null
+    const id = profile.id + ':' + pub
+    if (!pairKeys.current[id]) pairKeys.current[id] = derivePairKey(keys.priv, keys.pub, pub)
+    return pairKeys.current[id]
+  }
+
+  // turns an encrypted row from the database into a readable message
+  async function decryptMsg(m, profileMap) {
+    if (!m.enc) return m // old message from before encryption
+    const otherId = m.sender_id === myId ? m.receiver_id : m.sender_id
+    try {
+      const key = await getPairKey(profileMap[otherId])
+      if (!key) throw new Error('no key')
+      const data = await openJson(key, m.sender_id + '|' + m.receiver_id, m.enc)
+      const out = { ...m, content: data.t || '' }
+      if (data.f) {
+        out.file_name = data.f.n
+        out.file_type = data.f.y
+        out.file_size = data.f.s
+        out.duration = data.f.d || null
+        out.file_key = data.f.k
+      }
+      return out
+    } catch {
+      return { ...m, content: '', locked: true }
+    }
+  }
+
+  async function encryptFor(to, obj) {
+    const key = await getPairKey(profilesRef.current[to])
+    return sealJson(key, myId + '|' + to, obj)
+  }
+
+  // make sure the other person has set up encryption
+  async function ensurePeerKey(id) {
+    let p = profilesRef.current[id]
+    if (!p?.public_key) {
+      const { data } = await supabase.from('profiles').select('*').eq('id', id).single()
+      if (data) {
+        p = data
+        profilesRef.current[id] = data
+        addProfiles([data])
+      }
+    }
+    if (!p?.public_key) {
+      alert((nameOf(p) || 'This person') + ' has not set up encryption yet. Ask them to open Veil and finish the setup, then try again.')
+      return false
+    }
+    return true
   }
 
   function markDelivered() {
@@ -123,14 +199,17 @@ export default function ChatScreen({ session }) {
     const { data: msgs } = await supabase
       .from('messages').select('*')
       .order('created_at', { ascending: false }).limit(1000)
-    const list = (msgs || []).reverse()
-    setMessages(list)
-    if (list.some((m) => m.receiver_id === myId && !m.delivered_at)) markDelivered()
-    const ids = [...new Set(list.map((m) => (m.sender_id === myId ? m.receiver_id : m.sender_id)))]
+    const raw = (msgs || []).reverse()
+    const map = { ...profilesRef.current }
+    const ids = [...new Set(raw.map((m) => (m.sender_id === myId ? m.receiver_id : m.sender_id)))]
     if (ids.length) {
       const { data: ps } = await supabase.from('profiles').select('*').in('id', ids)
+      ;(ps || []).forEach((p) => (map[p.id] = p))
       addProfiles(ps || [])
     }
+    const list = await Promise.all(raw.map((m) => decryptMsg(m, map)))
+    setMessages(list)
+    if (list.some((m) => m.receiver_id === myId && !m.delivered_at)) markDelivered()
   }
 
   // load my profile + messages, then listen for new messages and status changes
@@ -145,31 +224,42 @@ export default function ChatScreen({ session }) {
     const channel = supabase
       .channel('my-messages')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
-        const m = payload.new
-        setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
-
-        const incoming = m.receiver_id === myId
+        const raw = payload.new
+        const incoming = raw.receiver_id === myId
         const screenHidden = document.visibilityState !== 'visible'
-        const viewing = !screenHidden && activeRef.current === m.sender_id
+        const viewing = !screenHidden && activeRef.current === raw.sender_id
         if (incoming) {
           markDelivered()
-          clearActivity(m.sender_id)
+          clearActivity(raw.sender_id)
           if (!viewing) playPing()
         }
 
-        const otherId = incoming ? m.sender_id : m.receiver_id
-        const { data } = await supabase.from('profiles').select('*').eq('id', otherId).single()
-        if (data) addProfiles([data])
+        const otherId = incoming ? raw.sender_id : raw.receiver_id
+        let p = profilesRef.current[otherId]
+        if (!p || !p.public_key) {
+          const { data } = await supabase.from('profiles').select('*').eq('id', otherId).single()
+          if (data) {
+            p = data
+            profilesRef.current[otherId] = data
+            addProfiles([data])
+          }
+        }
+
+        const m = await decryptMsg(raw, { [otherId]: p })
+        setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
 
         if (incoming && screenHidden) {
-          showNotification(nameOf(data) || 'Veil', previewText(m), 'msg-' + m.sender_id, {
-            from: m.sender_id,
+          showNotification(nameOf(p) || 'Veil', previewText(m), 'msg-' + raw.sender_id, {
+            from: raw.sender_id,
           })
         }
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, (payload) => {
         const n = payload.new
-        setMessages((prev) => prev.map((m) => (m.id === n.id ? { ...m, ...n } : m)))
+        // only the ticks change; never overwrite the decrypted text
+        setMessages((prev) =>
+          prev.map((m) => (m.id === n.id ? { ...m, read_at: n.read_at, delivered_at: n.delivered_at } : m))
+        )
       })
       .subscribe()
 
@@ -341,6 +431,7 @@ export default function ChatScreen({ session }) {
   }
 
   function openChat(user) {
+    profilesRef.current[user.id] = user
     addProfiles([user])
     setActive(user.id)
     setQuery('')
@@ -356,57 +447,70 @@ export default function ChatScreen({ session }) {
     e.preventDefault()
     const content = text.trim()
     if (!content || !active) return
+    const to = active
+    if (!(await ensurePeerKey(to))) return
     setText('')
-    sendActivity(active, 'none')
-    const { data, error } = await supabase
-      .from('messages')
-      .insert({ receiver_id: active, content })
-      .select()
-      .single()
-    if (error) {
-      alert(error.message)
+    sendActivity(to, 'none')
+    try {
+      const encrypted = await encryptFor(to, { t: content })
+      const { data, error } = await supabase
+        .from('messages')
+        .insert({ receiver_id: to, content: '', enc: encrypted })
+        .select()
+        .single()
+      if (error) throw error
+      const m = { ...data, content }
+      setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
+    } catch (err) {
+      alert(err.message || 'Could not send the message.')
       setText(content)
-      return
     }
-    setMessages((prev) => (prev.some((x) => x.id === data.id) ? prev : [...prev, data]))
   }
 
-  // upload a file or voice note, then send it as a message
+  // encrypt a file or voice note, upload it, then send the key inside an encrypted message
   async function uploadAndSend(file, name, type, to, duration) {
     if (!to) return
     if (file.size > MAX_SIZE) {
       alert('File is too big. Maximum is 25 MB.')
       return
     }
+    if (!(await ensurePeerKey(to))) return
     setPending({ to, name, voice: type.startsWith('audio/') && name.startsWith('voice-') })
     try {
-      const safe = name.replace(/[^a-zA-Z0-9._-]/g, '_')
-      const path = `${myId}/${Date.now()}-${safe}`
+      const sealed = await sealBytes(await file.arrayBuffer())
+      const path = `${myId}/${crypto.randomUUID()}`
       const { error: upErr } = await supabase.storage
         .from('chat-files')
-        .upload(path, file, { contentType: type })
+        .upload(path, sealed.blob, { contentType: 'application/octet-stream' })
       if (upErr) {
         alert(upErr.message)
         return
       }
+      const encrypted = await encryptFor(to, {
+        t: '',
+        f: { n: name, y: type, s: file.size, d: duration || null, k: sealed.key },
+      })
       const { data, error } = await supabase
         .from('messages')
-        .insert({
-          receiver_id: to,
-          content: '',
-          file_path: path,
-          file_name: name,
-          file_type: type,
-          file_size: file.size,
-          duration: duration || null,
-        })
+        .insert({ receiver_id: to, content: '', enc: encrypted, file_path: path })
         .select()
         .single()
       if (error) {
         alert(error.message)
         return
       }
-      setMessages((prev) => (prev.some((x) => x.id === data.id) ? prev : [...prev, data]))
+      const m = {
+        ...data,
+        content: '',
+        file_name: name,
+        file_type: type,
+        file_size: file.size,
+        duration: duration || null,
+        file_key: sealed.key,
+      }
+      setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
+    } catch (err) {
+      alert(err.message || 'Could not send the file.')
     } finally {
       setPending(null)
     }
@@ -510,7 +614,7 @@ export default function ChatScreen({ session }) {
           <button className="icon-btn" title="Settings" onClick={() => setShowSettings(true)}>
             <Icon name="settings" size={21} />
           </button>
-          <button className="icon-btn" title="Log out" onClick={() => supabase.auth.signOut()}>
+          <button className="icon-btn" title="Log out" onClick={logout}>
             <Icon name="logout" size={21} />
           </button>
         </header>
@@ -582,7 +686,7 @@ export default function ChatScreen({ session }) {
               <button className="back" onClick={() => setActive(null)}>
                 <Icon name="back" size={22} />
               </button>
-              <div className="head-click" title="View contact info" onClick={() => setShowProfile(true)}>
+              <div className="head-click" title="View contact info and security code" onClick={() => setShowProfile(true)}>
                 <Avatar profile={profiles[active]} online={showOnline(active)} />
                 <div className="who">
                   <b>{activeName}</b>
@@ -598,10 +702,22 @@ export default function ChatScreen({ session }) {
             </header>
 
             <div className="messages">
+              <div className="enc-note">
+                <Icon name="lock" size={13} />
+                <span>
+                  Messages and files in this chat are end-to-end encrypted. Tap the name above to check the security code.
+                </span>
+              </div>
               {chatMessages.map((m) => (
                 <div key={m.id} className={'bubble ' + (m.sender_id === myId ? 'me' : 'them')}>
-                  {m.file_path && <Attachment m={m} onOpen={() => openViewer(m)} />}
-                  {m.content}
+                  {m.locked ? (
+                    <span className="locked"><Icon name="lock" size={13} /> Can't decrypt this message</span>
+                  ) : (
+                    <>
+                      {m.file_path && <Attachment m={m} onOpen={() => openViewer(m)} />}
+                      {m.content}
+                    </>
+                  )}
                   <span className="t">
                     {fmt(m.created_at)}
                     {m.sender_id === myId && <Ticks m={m} />}
@@ -638,7 +754,7 @@ export default function ChatScreen({ session }) {
                   <Icon name="paperclip" size={20} />
                 </button>
                 <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={onPickFile} />
-                <input value={text} onChange={onType}
+                <input value={text} onChange={onType} maxLength={2000}
                        placeholder={uploading ? 'Sending...' : 'Type a message'} />
                 {text.trim() ? (
                   <button key="send" type="submit" className="swap" title="Send">
@@ -684,7 +800,12 @@ export default function ChatScreen({ session }) {
       )}
 
       {showProfile && active && profiles[active] && (
-        <ProfileView profile={profiles[active]} status={statusText} onClose={() => setShowProfile(false)} />
+        <ProfileView
+          profile={profiles[active]}
+          status={statusText}
+          myKey={keys.pub}
+          onClose={() => setShowProfile(false)}
+        />
       )}
     </div>
   )

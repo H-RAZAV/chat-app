@@ -1,7 +1,20 @@
+import { useEffect, useState } from 'react'
 import Avatar from './Avatar'
 import Icon from './Icon'
+import { safetyNumber } from './crypto'
 
-export default function ProfileView({ profile, status, onClose }) {
+export default function ProfileView({ profile, status, myKey, onClose }) {
+  const [code, setCode] = useState(null)
+  const name = profile.display_name || profile.username
+
+  useEffect(() => {
+    if (!myKey || !profile.public_key) {
+      setCode(null)
+      return
+    }
+    safetyNumber(myKey, profile.public_key).then(setCode)
+  }, [myKey, profile.public_key])
+
   return (
     <div className="modal" onClick={onClose}>
       <div className="panel" onClick={(e) => e.stopPropagation()}>
@@ -11,12 +24,28 @@ export default function ProfileView({ profile, status, onClose }) {
         </div>
         <div className="panel-body profile-view">
           <Avatar profile={profile} size={140} />
-          <h2>{profile.display_name || profile.username}</h2>
+          <h2>{name}</h2>
           <p className="pf-user">@{profile.username}</p>
           {status && <p className="pf-status">{status}</p>}
           <div className="pf-about">
             <small>About</small>
-            <p>{profile.about || 'Hey there! I am using this chat.'}</p>
+            <p>{profile.about || 'Hey there! I am using Veil.'}</p>
+          </div>
+          <div className="pf-about sec">
+            <small><Icon name="lock" size={13} /> End-to-end encryption</small>
+            {code ? (
+              <>
+                <div className="sec-code">
+                  {code.map((g, i) => <span key={i}>{g}</span>)}
+                </div>
+                <p className="sec-hint">
+                  To check that this chat is private, compare these numbers with {name}, in person or on a call.
+                  If they match on both phones, nobody is in the middle.
+                </p>
+              </>
+            ) : (
+              <p className="sec-hint">{name} has not set up encryption yet, so you cannot message each other until they do.</p>
+            )}
           </div>
         </div>
       </div>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import Avatar from './Avatar'
 import Icon from './Icon'
+import { Name, Tags } from './Verified'
 import { safetyNumber } from './crypto'
 
 export default function ProfileView({ profile, status, myKey, onClose }) {
@@ -24,8 +25,9 @@ export default function ProfileView({ profile, status, myKey, onClose }) {
         </div>
         <div className="panel-body profile-view">
           <Avatar profile={profile} size={140} />
-          <h2>{name}</h2>
+          <h2><Name p={profile} size={22} /></h2>
           <p className="pf-user">@{profile.username}</p>
+          <Tags profile={profile} />
           {status && <p className="pf-status">{status}</p>}
           <div className="pf-about">
             <small>About</small>

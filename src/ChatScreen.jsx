@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from './supabaseClient'
 import Attachment from './Attachment'
 import MediaViewer from './MediaViewer'
@@ -6,10 +6,12 @@ import CallScreen from './CallScreen'
 import Avatar from './Avatar'
 import Settings from './Settings'
 import ProfileView from './ProfileView'
+import Appearance from './Appearance'
+import AdminPanel from './AdminPanel'
+import { Name } from './Verified'
 import Icon from './Icon'
 import { useCall } from './useCall'
 import { useActivity } from './useActivity'
-import { getTheme, applyTheme } from './theme'
 import { playPing, unlockAudio, setBadge, showNotification } from './notify'
 import { derivePairKey, sealJson, openJson, sealBytes, clearKey } from './crypto'
 
@@ -18,15 +20,33 @@ const MAX_SIZE = 25 * 1024 * 1024 - 1024 // a little room for the encryption ove
 const fmt = (ts) =>
   new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 
+// ---------- dates ----------
+const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate())
+const daysAgo = (ts) => Math.round((startOfDay(new Date()) - startOfDay(new Date(ts))) / 86400000)
+const sameDay = (a, b) => startOfDay(new Date(a)).getTime() === startOfDay(new Date(b)).getTime()
+
+function dayLabel(ts) {
+  const n = daysAgo(ts)
+  if (n === 0) return 'Today'
+  if (n === 1) return 'Yesterday'
+  if (n > 1 && n < 7) return new Date(ts).toLocaleDateString([], { weekday: 'long' })
+  return new Date(ts).toLocaleDateString([], { day: 'numeric', month: 'long', year: 'numeric' })
+}
+
+function listTime(ts) {
+  const n = daysAgo(ts)
+  if (n === 0) return fmt(ts)
+  if (n === 1) return 'Yesterday'
+  if (n > 1 && n < 7) return new Date(ts).toLocaleDateString([], { weekday: 'long' })
+  return new Date(ts).toLocaleDateString([], { day: '2-digit', month: '2-digit', year: 'numeric' })
+}
+
 function lastSeenText(ts) {
   if (!ts) return ''
-  const d = new Date(ts)
-  const now = new Date()
-  const yesterday = new Date()
-  yesterday.setDate(now.getDate() - 1)
-  if (d.toDateString() === now.toDateString()) return 'last seen today at ' + fmt(ts)
-  if (d.toDateString() === yesterday.toDateString()) return 'last seen yesterday at ' + fmt(ts)
-  return 'last seen ' + d.toLocaleDateString() + ' at ' + fmt(ts)
+  const n = daysAgo(ts)
+  if (n === 0) return 'last seen today at ' + fmt(ts)
+  if (n === 1) return 'last seen yesterday at ' + fmt(ts)
+  return 'last seen ' + new Date(ts).toLocaleDateString() + ' at ' + fmt(ts)
 }
 
 function previewText(m) {
@@ -45,6 +65,14 @@ function preview(m) {
       <span className="pv">
         <Icon name="lock" size={14} />
         {previewText(m)}
+      </span>
+    )
+  }
+  if (m.is_broadcast) {
+    return (
+      <span className="pv">
+        <Icon name="megaphone" size={14} />
+        {m.content}
       </span>
     )
   }
@@ -79,6 +107,7 @@ const mmss = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0')
 export default function ChatScreen({ session, keys }) {
   const myId = session.user.id
   const [me, setMe] = useState(null)
+  const [official, setOfficial] = useState(null)
   const [messages, setMessages] = useState([])
   const [profiles, setProfiles] = useState({})
   const [active, setActive] = useState(null)
@@ -90,9 +119,10 @@ export default function ChatScreen({ session, keys }) {
   const [secs, setSecs] = useState(0)
   const [pending, setPending] = useState(null)
   const [showSettings, setShowSettings] = useState(false)
+  const [showAppearance, setShowAppearance] = useState(false)
+  const [showAdmin, setShowAdmin] = useState(false)
   const [showProfile, setShowProfile] = useState(false)
   const [viewer, setViewer] = useState(null)
-  const [theme, setTheme] = useState(getTheme())
   const [visible, setVisible] = useState(document.visibilityState === 'visible')
   const [perm, setPerm] = useState('Notification' in window ? Notification.permission : 'unsupported')
 
@@ -111,14 +141,8 @@ export default function ChatScreen({ session, keys }) {
   const {
     call, people, localStream, media, facing, canFlip, notice,
     startCall, acceptCall, hangup, toggleMic, toggleCam, flipCamera, inviteMore,
-  } = useCall(myId, myName)
+  } = useCall(myId, myName, !!me?.is_official) // the official account never receives calls
   const { activity, sendActivity, clearActivity } = useActivity(myId)
-
-  function toggleTheme() {
-    const next = theme === 'dark' ? 'light' : 'dark'
-    applyTheme(next)
-    setTheme(next)
-  }
 
   async function logout() {
     try {
@@ -198,6 +222,8 @@ export default function ChatScreen({ session, keys }) {
   async function fetchMessages() {
     const { data: msgs } = await supabase
       .from('messages').select('*')
+      // announcements you sent are not shown in your own chat list
+      .or(`is_broadcast.eq.false,sender_id.neq.${myId}`)
       .order('created_at', { ascending: false }).limit(1000)
     const raw = (msgs || []).reverse()
     const map = { ...profilesRef.current }
@@ -217,6 +243,11 @@ export default function ChatScreen({ session, keys }) {
     async function load() {
       const { data: mine } = await supabase.from('profiles').select('*').eq('id', myId).single()
       setMe(mine)
+      const { data: off } = await supabase.from('profiles').select('*').eq('is_official', true).limit(1).maybeSingle()
+      if (off) {
+        setOfficial(off)
+        addProfiles([off])
+      }
       await fetchMessages()
     }
     load()
@@ -225,6 +256,8 @@ export default function ChatScreen({ session, keys }) {
       .channel('my-messages')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
         const raw = payload.new
+        if (raw.is_broadcast && raw.sender_id === myId) return // our own announcement copies
+
         const incoming = raw.receiver_id === myId
         const screenHidden = document.visibilityState !== 'visible'
         const viewing = !screenHidden && activeRef.current === raw.sender_id
@@ -368,7 +401,7 @@ export default function ChatScreen({ session, keys }) {
     }
   }, [myId])
 
-  // refresh the open person's profile (fresh last seen, photo, about)
+  // refresh the open person's profile (fresh last seen, photo, about, ticks)
   useEffect(() => {
     if (!active) return
     supabase.from('profiles').select('*').eq('id', active).single()
@@ -404,6 +437,13 @@ export default function ChatScreen({ session, keys }) {
       .map(([id, last]) => ({ id, last }))
       .sort((a, b) => new Date(b.last.created_at) - new Date(a.last.created_at))
   }, [messages, myId])
+
+  // the official Veil account is always pinned at the top for everyone else
+  const chatList = useMemo(() => {
+    if (!official || official.id === myId) return conversations
+    const own = conversations.find((c) => c.id === official.id)
+    return [own || { id: official.id, last: null }, ...conversations.filter((c) => c.id !== official.id)]
+  }, [conversations, official, myId])
 
   const chatMessages = messages.filter((m) => m.sender_id === active || m.receiver_id === active)
   const mediaItems = chatMessages.filter(isMedia)
@@ -588,11 +628,14 @@ export default function ChatScreen({ session, keys }) {
 
   // people you can add to a call: your chats who are online right now
   const callContacts = conversations
-    .filter(({ id }) => online.has(id) && profiles[id])
+    .filter(({ id }) => online.has(id) && profiles[id] && !profiles[id].is_official)
     .map(({ id }) => ({ id, username: nameOf(profiles[id]), profile: profiles[id] }))
 
   const activeName = nameOf(profiles[active])
-  const statusText = hidden(active)
+  const peerIsOfficial = !!profiles[active]?.is_official
+  const statusText = peerIsOfficial
+    ? 'Official account'
+    : hidden(active)
     ? ''
     : online.has(active)
     ? 'online'
@@ -607,9 +650,14 @@ export default function ChatScreen({ session, keys }) {
           <div style={{ cursor: 'pointer' }} onClick={() => setShowSettings(true)}>
             <Avatar profile={me} />
           </div>
-          <b>{nameOf(me)}</b>
-          <button className="icon-btn" title={theme === 'dark' ? 'Light mode' : 'Dark mode'} onClick={toggleTheme}>
-            <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={21} />
+          <b><Name p={me} /></b>
+          {me?.is_official && (
+            <button className="icon-btn" title="Veil admin" onClick={() => setShowAdmin(true)}>
+              <Icon name="shield" size={21} />
+            </button>
+          )}
+          <button className="icon-btn" title="Appearance" onClick={() => setShowAppearance(true)}>
+            <Icon name="palette" size={21} />
           </button>
           <button className="icon-btn" title="Settings" onClick={() => setShowSettings(true)}>
             <Icon name="settings" size={21} />
@@ -638,7 +686,7 @@ export default function ChatScreen({ session, keys }) {
                 <div key={u.id} className="item" onClick={() => openChat(u)}>
                   <Avatar profile={u} online={online.has(u.id) && !u.hide_last_seen} />
                   <div className="meta">
-                    <div className="name">{nameOf(u)}</div>
+                    <div className="name"><Name p={u} /></div>
                     <div className="sub">@{u.username}{u.about ? ' · ' + u.about : ''}</div>
                   </div>
                 </div>
@@ -646,32 +694,37 @@ export default function ChatScreen({ session, keys }) {
             ) : (
               <p className="empty">No user found</p>
             )
-          ) : conversations.length ? (
-            conversations.map(({ id, last }) => (
-              <div key={id} className={'item' + (id === active ? ' active' : '')}
-                   onClick={() => setActive(id)}>
-                <Avatar profile={profiles[id]} online={showOnline(id)} />
-                <div className="meta">
-                  <div className="top">
-                    <span className="name">{nameOf(profiles[id]) || '...'}</span>
-                    <span className={'time' + (unread[id] ? ' new' : '')}>{fmt(last.created_at)}</span>
-                  </div>
-                  <div className="row2">
-                    <div className={'last' + (activity[id] ? ' act' : '')}>
-                      {activity[id] ? (
-                        actText(activity[id])
-                      ) : (
-                        <>
-                          {last.sender_id === myId && <Ticks m={last} size={15} />}
-                          {preview(last)}
-                        </>
-                      )}
+          ) : chatList.length ? (
+            chatList.map(({ id, last }) => {
+              const isOfficial = official && id === official.id && official.id !== myId
+              return (
+                <div key={id} className={'item' + (id === active ? ' active' : '') + (isOfficial ? ' pinned' : '')}
+                     onClick={() => setActive(id)}>
+                  <Avatar profile={profiles[id]} online={showOnline(id) && !isOfficial} />
+                  <div className="meta">
+                    <div className="top">
+                      <span className="name"><Name p={profiles[id]} /></span>
+                      {last && <span className={'time' + (unread[id] ? ' new' : '')}>{listTime(last.created_at)}</span>}
                     </div>
-                    {unread[id] > 0 && <span className="badge">{unread[id] > 99 ? '99+' : unread[id]}</span>}
+                    <div className="row2">
+                      <div className={'last' + (activity[id] ? ' act' : '')}>
+                        {activity[id] ? (
+                          actText(activity[id])
+                        ) : last ? (
+                          <>
+                            {last.sender_id === myId && <Ticks m={last} size={15} />}
+                            {preview(last)}
+                          </>
+                        ) : (
+                          'Support and updates. Message us anytime.'
+                        )}
+                      </div>
+                      {unread[id] > 0 && <span className="badge">{unread[id] > 99 ? '99+' : unread[id]}</span>}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))
+              )
+            })
           ) : (
             <p className="empty">No chats yet. Search for a username above to start chatting.</p>
           )}
@@ -687,18 +740,22 @@ export default function ChatScreen({ session, keys }) {
                 <Icon name="back" size={22} />
               </button>
               <div className="head-click" title="View contact info and security code" onClick={() => setShowProfile(true)}>
-                <Avatar profile={profiles[active]} online={showOnline(active)} />
+                <Avatar profile={profiles[active]} online={showOnline(active) && !peerIsOfficial} />
                 <div className="who">
-                  <b>{activeName}</b>
+                  <b><Name p={profiles[active]} /></b>
                   <small className={act ? 'act' : ''}>{act ? actText(act) : statusText}</small>
                 </div>
               </div>
-              <button className="icon-btn" title="Video call" onClick={() => callPeer(true)}>
-                <Icon name="video" size={22} />
-              </button>
-              <button className="icon-btn" title="Voice call" onClick={() => callPeer(false)}>
-                <Icon name="phone" size={20} />
-              </button>
+              {!peerIsOfficial && (
+                <>
+                  <button className="icon-btn" title="Video call" onClick={() => callPeer(true)}>
+                    <Icon name="video" size={22} />
+                  </button>
+                  <button className="icon-btn" title="Voice call" onClick={() => callPeer(false)}>
+                    <Icon name="phone" size={20} />
+                  </button>
+                </>
+              )}
             </header>
 
             <div className="messages">
@@ -708,21 +765,29 @@ export default function ChatScreen({ session, keys }) {
                   Messages and files in this chat are end-to-end encrypted. Tap the name above to check the security code.
                 </span>
               </div>
-              {chatMessages.map((m) => (
-                <div key={m.id} className={'bubble ' + (m.sender_id === myId ? 'me' : 'them')}>
-                  {m.locked ? (
-                    <span className="locked"><Icon name="lock" size={13} /> Can't decrypt this message</span>
-                  ) : (
-                    <>
-                      {m.file_path && <Attachment m={m} onOpen={() => openViewer(m)} />}
-                      {m.content}
-                    </>
+              {chatMessages.map((m, i) => (
+                <Fragment key={m.id}>
+                  {(i === 0 || !sameDay(chatMessages[i - 1].created_at, m.created_at)) && (
+                    <div className="day-sep"><span>{dayLabel(m.created_at)}</span></div>
                   )}
-                  <span className="t">
-                    {fmt(m.created_at)}
-                    {m.sender_id === myId && <Ticks m={m} />}
-                  </span>
-                </div>
+                  <div className={'bubble ' + (m.sender_id === myId ? 'me' : 'them')}>
+                    {m.locked ? (
+                      <span className="locked"><Icon name="lock" size={13} /> Can't decrypt this message</span>
+                    ) : (
+                      <>
+                        {m.is_broadcast && (
+                          <div className="bcast"><Icon name="megaphone" size={13} /> Announcement</div>
+                        )}
+                        {m.file_path && <Attachment m={m} onOpen={() => openViewer(m)} />}
+                        {m.content}
+                      </>
+                    )}
+                    <span className="t">
+                      {fmt(m.created_at)}
+                      {m.sender_id === myId && <Ticks m={m} />}
+                    </span>
+                  </div>
+                </Fragment>
               ))}
               {pending && pending.to === active && (
                 <div className="bubble me sending">
@@ -797,6 +862,17 @@ export default function ChatScreen({ session, keys }) {
 
       {showSettings && me && (
         <Settings me={me} onClose={() => setShowSettings(false)} onSaved={(p) => setMe(p)} />
+      )}
+
+      {showAppearance && <Appearance onClose={() => setShowAppearance(false)} />}
+
+      {showAdmin && me?.is_official && (
+        <AdminPanel
+          myId={myId}
+          keys={keys}
+          onClose={() => setShowAdmin(false)}
+          onOpenChat={(u) => { openChat(u); setShowAdmin(false) }}
+        />
       )}
 
       {showProfile && active && profiles[active] && (

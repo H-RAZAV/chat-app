@@ -67,7 +67,7 @@ async function getMedia(video) {
   }
 }
 
-export function useCall(myId, myName) {
+export function useCall(myId, myName, blockIncoming = false) {
   const [call, setCall] = useState(null)
   const [people, setPeople] = useState({})
   const [localStream, setLocalStream] = useState(null)
@@ -76,6 +76,8 @@ export function useCall(myId, myName) {
   const [canFlip, setCanFlip] = useState(false)
   const [notice, setNotice] = useState('')
 
+  const blockRef = useRef(blockIncoming)
+  blockRef.current = blockIncoming
   const nameRef = useRef(myName)
   nameRef.current = myName
 
@@ -407,6 +409,7 @@ export function useCall(myId, myName) {
     const c = callRef.current
 
     if (s.type === 'invite') {
+      if (blockRef.current) return
       if (c) {
         signal(s.from, { type: 'busy', room: s.room })
         return

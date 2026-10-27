@@ -1,9 +1,9 @@
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
-import { getTheme } from './theme'
+import { initAppearance } from './theme'
 
-document.documentElement.setAttribute('data-theme', getTheme())
+initAppearance()
 
 createRoot(document.getElementById('root')).render(<App />)
 

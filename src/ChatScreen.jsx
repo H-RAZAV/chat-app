@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from './supabaseClient'
 import Attachment from './Attachment'
+import MediaViewer from './MediaViewer'
 import CallScreen from './CallScreen'
 import Avatar from './Avatar'
 import Settings from './Settings'
@@ -51,6 +52,16 @@ function preview(m) {
   )
 }
 
+const isMedia = (m) =>
+  !!m.file_path && ((m.file_type || '').startsWith('image/') || (m.file_type || '').startsWith('video/'))
+
+// sent, delivered, read
+function Ticks({ m, size = 16 }) {
+  if (m.read_at) return <Icon name="checkAll" size={size} className="tick read" />
+  if (m.delivered_at) return <Icon name="checkAll" size={size} className="tick" />
+  return <Icon name="check" size={size} className="tick" />
+}
+
 const nameOf = (p) => p?.display_name || p?.username || ''
 const actText = (k) => (k === 'recording' ? 'recording audio...' : 'typing...')
 const mmss = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0')
@@ -70,6 +81,7 @@ export default function ChatScreen({ session }) {
   const [pending, setPending] = useState(null)
   const [showSettings, setShowSettings] = useState(false)
   const [showProfile, setShowProfile] = useState(false)
+  const [viewer, setViewer] = useState(null)
   const [theme, setTheme] = useState(getTheme())
   const [visible, setVisible] = useState(document.visibilityState === 'visible')
   const [perm, setPerm] = useState('Notification' in window ? Notification.permission : 'unsupported')
@@ -83,7 +95,10 @@ export default function ChatScreen({ session }) {
 
   const uploading = !!pending
   const myName = nameOf(me) || session.user.user_metadata?.username || 'someone'
-  const { call, localStream, remoteStream, startCall, acceptCall, hangup } = useCall(myId, myName)
+  const {
+    call, people, localStream, media, facing, canFlip, notice,
+    startCall, acceptCall, hangup, toggleMic, toggleCam, flipCamera, inviteMore,
+  } = useCall(myId, myName)
   const { activity, sendActivity, clearActivity } = useActivity(myId)
 
   function toggleTheme() {
@@ -100,12 +115,17 @@ export default function ChatScreen({ session }) {
     })
   }
 
+  function markDelivered() {
+    supabase.rpc('mark_delivered').then(() => {})
+  }
+
   async function fetchMessages() {
     const { data: msgs } = await supabase
       .from('messages').select('*')
       .order('created_at', { ascending: false }).limit(1000)
     const list = (msgs || []).reverse()
     setMessages(list)
+    if (list.some((m) => m.receiver_id === myId && !m.delivered_at)) markDelivered()
     const ids = [...new Set(list.map((m) => (m.sender_id === myId ? m.receiver_id : m.sender_id)))]
     if (ids.length) {
       const { data: ps } = await supabase.from('profiles').select('*').in('id', ids)
@@ -113,7 +133,7 @@ export default function ChatScreen({ session }) {
     }
   }
 
-  // load my profile + messages, then listen for new messages
+  // load my profile + messages, then listen for new messages and status changes
   useEffect(() => {
     async function load() {
       const { data: mine } = await supabase.from('profiles').select('*').eq('id', myId).single()
@@ -132,6 +152,7 @@ export default function ChatScreen({ session }) {
         const screenHidden = document.visibilityState !== 'visible'
         const viewing = !screenHidden && activeRef.current === m.sender_id
         if (incoming) {
+          markDelivered()
           clearActivity(m.sender_id)
           if (!viewing) playPing()
         }
@@ -141,10 +162,14 @@ export default function ChatScreen({ session }) {
         if (data) addProfiles([data])
 
         if (incoming && screenHidden) {
-          showNotification(nameOf(data) || 'New message', previewText(m), 'msg-' + m.sender_id, {
+          showNotification(nameOf(data) || 'Veil', previewText(m), 'msg-' + m.sender_id, {
             from: m.sender_id,
           })
         }
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, (payload) => {
+        const n = payload.new
+        setMessages((prev) => prev.map((m) => (m.id === n.id ? { ...m, ...n } : m)))
       })
       .subscribe()
 
@@ -199,7 +224,7 @@ export default function ChatScreen({ session }) {
 
   // tab title and app icon badge
   useEffect(() => {
-    document.title = totalUnread ? `(${totalUnread}) Chat App` : 'Chat App'
+    document.title = totalUnread ? `(${totalUnread}) Veil` : 'Veil'
     setBadge(totalUnread)
   }, [totalUnread])
 
@@ -211,7 +236,9 @@ export default function ChatScreen({ session }) {
       const now = new Date().toISOString()
       setMessages((prev) =>
         prev.map((m) =>
-          m.sender_id === active && m.receiver_id === myId && !m.read_at ? { ...m, read_at: now } : m
+          m.sender_id === active && m.receiver_id === myId && !m.read_at
+            ? { ...m, read_at: now, delivered_at: m.delivered_at || now }
+            : m
         )
       )
     })
@@ -289,10 +316,29 @@ export default function ChatScreen({ session }) {
   }, [messages, myId])
 
   const chatMessages = messages.filter((m) => m.sender_id === active || m.receiver_id === active)
+  const mediaItems = chatMessages.filter(isMedia)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatMessages.length, active, pending])
+
+  // photo and video viewer: the phone's back button closes it instead of leaving Veil
+  const viewerOpen = viewer !== null
+  useEffect(() => {
+    if (!viewerOpen) return
+    window.history.pushState({ veilViewer: true }, '')
+    const onPop = () => setViewer(null)
+    window.addEventListener('popstate', onPop)
+    return () => {
+      window.removeEventListener('popstate', onPop)
+      if (window.history.state && window.history.state.veilViewer) window.history.back()
+    }
+  }, [viewerOpen])
+
+  function openViewer(m) {
+    const i = mediaItems.findIndex((x) => x.id === m.id)
+    if (i >= 0) setViewer(i)
+  }
 
   function openChat(user) {
     addProfiles([user])
@@ -430,11 +476,16 @@ export default function ChatScreen({ session }) {
   // calls (still work even if the person hides their status)
   function callPeer(video) {
     if (!online.has(active)) {
-      alert(activeName + ' is offline. Calls work only when they have the app open.')
+      alert(activeName + ' is offline. Calls work only when they have Veil open.')
       return
     }
-    startCall({ id: active, username: activeName }, video)
+    startCall([{ id: active, username: activeName }], video)
   }
+
+  // people you can add to a call: your chats who are online right now
+  const callContacts = conversations
+    .filter(({ id }) => online.has(id) && profiles[id])
+    .map(({ id }) => ({ id, username: nameOf(profiles[id]), profile: profiles[id] }))
 
   const activeName = nameOf(profiles[active])
   const statusText = hidden(active)
@@ -507,7 +558,7 @@ export default function ChatScreen({ session }) {
                         actText(activity[id])
                       ) : (
                         <>
-                          {last.sender_id === myId ? 'You: ' : ''}
+                          {last.sender_id === myId && <Ticks m={last} size={15} />}
                           {preview(last)}
                         </>
                       )}
@@ -549,9 +600,12 @@ export default function ChatScreen({ session }) {
             <div className="messages">
               {chatMessages.map((m) => (
                 <div key={m.id} className={'bubble ' + (m.sender_id === myId ? 'me' : 'them')}>
-                  {m.file_path && <Attachment m={m} />}
+                  {m.file_path && <Attachment m={m} onOpen={() => openViewer(m)} />}
                   {m.content}
-                  <span className="t">{fmt(m.created_at)}</span>
+                  <span className="t">
+                    {fmt(m.created_at)}
+                    {m.sender_id === myId && <Ticks m={m} />}
+                  </span>
                 </div>
               ))}
               {pending && pending.to === active && (
@@ -601,14 +655,29 @@ export default function ChatScreen({ session }) {
           </>
         ) : (
           <div className="placeholder">
-            <h2>Your chat app</h2>
+            <img src="/veil-icon.svg" alt="Veil" />
+            <h2>Veil</h2>
             <p>Search a username on the left to start a conversation.</p>
           </div>
         )}
       </main>
 
-      <CallScreen call={call} localStream={localStream} remoteStream={remoteStream}
-                  onAccept={acceptCall} onHangup={hangup} />
+      <CallScreen
+        call={call} people={people} localStream={localStream} media={media} facing={facing}
+        canFlip={canFlip} notice={notice} contacts={callContacts}
+        onAccept={acceptCall} onHangup={hangup} onToggleMic={toggleMic} onToggleCam={toggleCam}
+        onFlip={flipCamera} onInvite={inviteMore}
+      />
+
+      {viewer !== null && mediaItems[viewer] && (
+        <MediaViewer
+          items={mediaItems}
+          index={viewer}
+          onIndex={setViewer}
+          onClose={() => setViewer(null)}
+          titleOf={(m) => (m.sender_id === myId ? 'You' : nameOf(profiles[m.sender_id]))}
+        />
+      )}
 
       {showSettings && me && (
         <Settings me={me} onClose={() => setShowSettings(false)} onSaved={(p) => setMe(p)} />

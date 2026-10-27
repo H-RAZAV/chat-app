@@ -49,7 +49,11 @@ export default function Login() {
   return (
     <div className="login-page">
       <form className="login-card" onSubmit={submit}>
-        <h2>{mode === 'login' ? 'Log in' : 'Create account'}</h2>
+           <div className="brand">
+     <img src="/veil-icon.svg" alt="" />
+     <h1>Veil</h1>
+     <p>{mode === 'login' ? 'Welcome back' : 'Create your account'}</p>
+   </div>
         <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} required />
         {mode === 'signup' && (
           <input placeholder="Username (e.g. ali_123)" value={username} onChange={(e) => setUsername(e.target.value)} required />

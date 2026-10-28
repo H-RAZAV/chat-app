@@ -8,6 +8,12 @@ const STUN = [
   { urls: 'stun:stun1.l.google.com:19302' },
 ]
 
+// screen sharing works in desktop browsers only
+export const canShareScreen =
+  typeof navigator !== 'undefined' &&
+  !!navigator.mediaDevices?.getDisplayMedia &&
+  !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+
 // accepts "name", "name.metered.live" or "https://name.metered.live/"
 function meteredHost() {
   let app = (import.meta.env.VITE_METERED_APP || '').trim()
@@ -71,6 +77,7 @@ export function useCall(myId, myName, blockIncoming = false) {
   const [call, setCall] = useState(null)
   const [people, setPeople] = useState({})
   const [localStream, setLocalStream] = useState(null)
+  const [localScreen, setLocalScreen] = useState(null)
   const [media, setMedia] = useState({ mic: true, cam: true })
   const [facing, setFacing] = useState('user')
   const [canFlip, setCanFlip] = useState(false)
@@ -82,8 +89,10 @@ export function useCall(myId, myName, blockIncoming = false) {
   nameRef.current = myName
 
   const callRef = useRef(null)
-  const peers = useRef({}) // id -> { pc, pending, remote, queue, ready, timer }
+  const peers = useRef({})
   const local = useRef(null)
+  const screenRef = useRef(null)
+  const pendingScreen = useRef({})
   const invite = useRef(null)
   const invited = useRef(new Set())
   const names = useRef({})
@@ -130,9 +139,17 @@ export function useCall(myId, myName, blockIncoming = false) {
       e.pc.onicecandidate = null
       e.pc.ontrack = null
       e.pc.onconnectionstatechange = null
+      e.pc.onsignalingstatechange = null
       e.pc.close()
     })
     peers.current = {}
+    screenRef.current?.getTracks().forEach((t) => {
+      t.onended = null
+      t.stop()
+    })
+    screenRef.current = null
+    pendingScreen.current = {}
+    setLocalScreen(null)
     local.current?.getTracks().forEach((t) => t.stop())
     local.current = null
     invite.current = null
@@ -174,11 +191,22 @@ export function useCall(myId, myName, blockIncoming = false) {
     e.pending.splice(0).forEach((c) => e.pc.addIceCandidate(c).catch(() => {}))
   }
 
+  // works out which of a person's streams is their camera and which is their screen
+  function syncStreams(id) {
+    const e = peers.current[id]
+    if (!e) return
+    const live = Object.values(e.streams).filter((s) => s.getTracks().length > 0)
+    const screen = e.screenId ? live.find((s) => s.id === e.screenId) || null : null
+    const cam = live.find((s) => s.id !== e.screenId) || null
+    setPeople((ps) => (ps[id] ? { ...ps, [id]: { ...ps[id], stream: cam, screen } } : ps))
+  }
+
   function removePeer(id) {
     const e = peers.current[id]
     if (!e) return
     clearTimeout(e.timer)
     e.pc.onconnectionstatechange = null
+    e.pc.onsignalingstatechange = null
     e.pc.close()
     delete peers.current[id]
     setPeople((ps) => {
@@ -199,13 +227,31 @@ export function useCall(myId, myName, blockIncoming = false) {
     }
   }
 
+  // keeps the shared screen sharp but not too heavy
+  function tune(e) {
+    if (!e.screenSender) return
+    try {
+      const p = e.screenSender.getParameters()
+      if (!p.encodings || !p.encodings.length) p.encodings = [{}]
+      p.encodings[0].maxBitrate = 1500000
+      e.screenSender.setParameters(p).catch(() => {})
+    } catch {
+      /* ignore */
+    }
+  }
+
   function addPeer(id, name) {
     if (peers.current[id]) return peers.current[id]
     if (name) names.current[id] = name
 
     const pc = new RTCPeerConnection(iceInfo.current.config)
-    const entry = { pc, pending: earlyIce.current[id] || [], remote: false, queue: [], ready: false, timer: null }
+    const entry = {
+      pc, pending: earlyIce.current[id] || [], remote: false, queue: [], ready: false, timer: null,
+      making: false, dirty: false, rosterSent: false, screenSender: null,
+      screenId: pendingScreen.current[id] || null, streams: {},
+    }
     delete earlyIce.current[id]
+    delete pendingScreen.current[id]
     peers.current[id] = entry
 
     pc.onicecandidate = (e) => {
@@ -215,7 +261,14 @@ export function useCall(myId, myName, blockIncoming = false) {
       else entry.queue.push(c)
     }
     pc.ontrack = (e) => {
-      setPeople((ps) => (ps[id] ? { ...ps, [id]: { ...ps[id], stream: e.streams[0] } } : ps))
+      const stream = e.streams[0]
+      if (!stream) return
+      entry.streams[stream.id] = stream
+      syncStreams(id)
+    }
+    // if something changed while negotiating (for example a screen share), do it again when ready
+    pc.onsignalingstatechange = () => {
+      if (pc.signalingState === 'stable' && entry.dirty) setTimeout(() => renegotiate(id), 0)
     }
     pc.onconnectionstatechange = () => {
       console.log('[call]', id.slice(0, 6), pc.connectionState)
@@ -234,9 +287,20 @@ export function useCall(myId, myName, blockIncoming = false) {
     }, 25000)
 
     local.current.getTracks().forEach((t) => pc.addTrack(t, local.current))
+
+    // somebody is already sharing their screen: this new person gets it too
+    if (screenRef.current) {
+      const track = screenRef.current.getVideoTracks()[0]
+      if (track) {
+        signal(id, { type: 'screen', on: true, sid: screenRef.current.id })
+        entry.screenSender = pc.addTrack(track, screenRef.current)
+        entry.dirty = true
+      }
+    }
+
     setPeople((ps) => ({
       ...ps,
-      [id]: { id, name: names.current[id] || 'Participant', stream: null, state: 'connecting', cam: true, mic: true },
+      [id]: { id, name: names.current[id] || 'Participant', stream: null, screen: null, state: 'connecting', cam: true, mic: true },
     }))
     invited.current.delete(id)
     return entry
@@ -245,14 +309,46 @@ export function useCall(myId, myName, blockIncoming = false) {
   async function makeOffer(id) {
     const e = peers.current[id]
     if (!e) return
-    const offer = await e.pc.createOffer()
-    await e.pc.setLocalDescription(offer)
-    signal(id, { type: 'offer', sdp: { type: offer.type, sdp: offer.sdp } })
-    e.ready = true
-    e.queue.splice(0).forEach((cand) => signal(id, { type: 'ice', candidate: cand }))
+    e.making = true
+    try {
+      const offer = await e.pc.createOffer()
+      await e.pc.setLocalDescription(offer)
+      signal(id, { type: 'offer', sdp: { type: offer.type, sdp: offer.sdp } })
+      e.ready = true
+      e.queue.splice(0).forEach((cand) => signal(id, { type: 'ice', candidate: cand }))
+      tune(e)
+    } finally {
+      e.making = false
+    }
   }
 
-  // the person with the smaller id always makes the offer, so two people never offer at once
+  // a new offer for a call that is already running (adding or removing a screen share)
+  async function renegotiate(id) {
+    const e = peers.current[id]
+    if (!e) return
+    if (!e.pc.remoteDescription || e.pc.signalingState !== 'stable' || e.making) {
+      e.dirty = true
+      return
+    }
+    e.dirty = false
+    e.making = true
+    try {
+      const offer = await e.pc.createOffer()
+      if (e.pc.signalingState !== 'stable') {
+        e.dirty = true
+        return
+      }
+      await e.pc.setLocalDescription(offer)
+      signal(id, { type: 'offer', sdp: { type: offer.type, sdp: offer.sdp } })
+      tune(e)
+    } catch {
+      /* ignore */
+    } finally {
+      e.making = false
+    }
+  }
+
+  // the person with the smaller id always makes the first offer, so two people never offer at once
   function connectTo(id, name) {
     if (id === myId || peers.current[id] || !local.current) return
     if (Object.keys(peers.current).length + 1 >= MAX_PEOPLE) return
@@ -383,7 +479,8 @@ export function useCall(myId, myName, blockIncoming = false) {
       track.enabled = wasOn
       stream.addTrack(track)
       Object.values(peers.current).forEach((e) => {
-        const sender = e.pc.getSenders().find((x) => x.track && x.track.kind === 'video')
+        // never touch the screen-share sender
+        const sender = e.pc.getSenders().find((x) => x !== e.screenSender && x.track && x.track.kind === 'video')
         if (sender) sender.replaceTrack(track)
       })
       setFacing(mode)
@@ -403,6 +500,76 @@ export function useCall(myId, myName, blockIncoming = false) {
       }
       tell('Could not switch the camera.')
     }
+  }
+
+  // ---------- screen sharing ----------
+  async function startShare() {
+    if (!callRef.current || callRef.current.status === 'incoming' || screenRef.current) return
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      tell('Screen sharing is not supported on this device.')
+      return
+    }
+    const other = Object.values(people).find((p) => p.screen)
+    if (other) {
+      tell(other.name + ' is already sharing their screen.')
+      return
+    }
+
+    let stream
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 15, max: 24 } },
+        audio: false,
+      })
+    } catch {
+      return // you closed the picker
+    }
+    if (!callRef.current) {
+      stream.getTracks().forEach((t) => t.stop())
+      return
+    }
+
+    const track = stream.getVideoTracks()[0]
+    try {
+      track.contentHint = 'detail'
+    } catch {
+      /* ignore */
+    }
+    screenRef.current = stream
+    setLocalScreen(stream)
+    // the browser's own "Stop sharing" button
+    track.onended = () => stopShare()
+
+    Object.keys(peers.current).forEach((id) => {
+      const e = peers.current[id]
+      signal(id, { type: 'screen', on: true, sid: stream.id })
+      e.screenSender = e.pc.addTrack(track, stream)
+      renegotiate(id)
+    })
+  }
+
+  function stopShare() {
+    const stream = screenRef.current
+    if (!stream) return
+    screenRef.current = null
+    setLocalScreen(null)
+    stream.getTracks().forEach((t) => {
+      t.onended = null
+      t.stop()
+    })
+    Object.keys(peers.current).forEach((id) => {
+      const e = peers.current[id]
+      signal(id, { type: 'screen', on: false })
+      if (e.screenSender) {
+        try {
+          e.pc.removeTrack(e.screenSender)
+        } catch {
+          /* ignore */
+        }
+        e.screenSender = null
+      }
+      renegotiate(id)
+    })
   }
 
   async function onSignal(s) {
@@ -449,33 +616,61 @@ export function useCall(myId, myName, blockIncoming = false) {
     } else if (s.type === 'offer') {
       if (!local.current) return
       if (!peers.current[s.from] && Object.keys(peers.current).length + 1 >= MAX_PEOPLE) return
-      const e = addPeer(s.from, s.fromName)
-      await e.pc.setRemoteDescription(s.sdp)
-      e.remote = true
-      flushPending(e)
-      const answer = await e.pc.createAnswer()
-      await e.pc.setLocalDescription(answer)
-      signal(s.from, { type: 'answer', sdp: { type: answer.type, sdp: answer.sdp } })
-      e.ready = true
-      e.queue.splice(0).forEach((cand) => signal(s.from, { type: 'ice', candidate: cand }))
-      // tell the newcomer who else is here
-      const others = Object.keys(peers.current)
-        .filter((id) => id !== s.from)
-        .map((id) => ({ id, name: names.current[id] || 'Participant' }))
-      if (others.length) signal(s.from, { type: 'roster', members: others })
+      try {
+        const e = addPeer(s.from, s.fromName)
+        // two offers at the same moment: one side gives way
+        const collision = e.making || e.pc.signalingState !== 'stable'
+        const polite = myId > s.from
+        if (collision && !polite) return
+        if (collision) e.dirty = true // we will offer again once this is settled
+        await e.pc.setRemoteDescription(s.sdp)
+        e.remote = true
+        flushPending(e)
+        const answer = await e.pc.createAnswer()
+        await e.pc.setLocalDescription(answer)
+        signal(s.from, { type: 'answer', sdp: { type: answer.type, sdp: answer.sdp } })
+        e.ready = true
+        e.queue.splice(0).forEach((cand) => signal(s.from, { type: 'ice', candidate: cand }))
+        // tell the newcomer who else is here (only once)
+        if (!e.rosterSent) {
+          e.rosterSent = true
+          const others = Object.keys(peers.current)
+            .filter((id) => id !== s.from)
+            .map((id) => ({ id, name: names.current[id] || 'Participant' }))
+          if (others.length) signal(s.from, { type: 'roster', members: others })
+        }
+      } catch (err) {
+        console.log('[call] offer failed', err)
+      }
     } else if (s.type === 'answer') {
       const e = peers.current[s.from]
-      if (!e) return
-      await e.pc.setRemoteDescription(s.sdp)
-      e.remote = true
-      flushPending(e)
+      if (!e || e.pc.signalingState !== 'have-local-offer') return
+      try {
+        await e.pc.setRemoteDescription(s.sdp)
+        e.remote = true
+        flushPending(e)
+      } catch (err) {
+        console.log('[call] answer failed', err)
+      }
     } else if (s.type === 'ice') {
       const e = peers.current[s.from]
       if (!e) {
         if (!earlyIce.current[s.from]) earlyIce.current[s.from] = []
         earlyIce.current[s.from].push(s.candidate)
-      } else if (e.remote) e.pc.addIceCandidate(s.candidate).catch(() => {})
+      } else if (e.pc.remoteDescription) e.pc.addIceCandidate(s.candidate).catch(() => {})
       else e.pending.push(s.candidate)
+    } else if (s.type === 'screen') {
+      const e = peers.current[s.from]
+      if (!e) {
+        pendingScreen.current[s.from] = s.on ? s.sid : null
+        return
+      }
+      if (s.on) e.screenId = s.sid
+      else {
+        if (e.screenId) delete e.streams[e.screenId]
+        e.screenId = null
+      }
+      syncStreams(s.from)
     } else if (s.type === 'roster') {
       ;(s.members || []).forEach((m) => connectTo(m.id, m.name))
     } else if (s.type === 'state') {
@@ -536,7 +731,8 @@ export function useCall(myId, myName, blockIncoming = false) {
   }, [myId])
 
   return {
-    call, people, localStream, media, facing, canFlip, notice,
+    call, people, localStream, localScreen, media, facing, canFlip, notice,
     startCall, acceptCall, hangup, toggleMic, toggleCam, flipCamera, inviteMore,
+    startShare, stopShare,
   }
 }

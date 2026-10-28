@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Icon from './Icon'
 import Avatar from './Avatar'
+import { canShareScreen } from './useCall'
 
 function Tile({ stream, name, camOn, micOn, muted, mirror }) {
   const ref = useRef(null)
@@ -31,11 +32,21 @@ function Tile({ stream, name, camOn, micOn, muted, mirror }) {
   )
 }
 
+// the shared screen (picture only)
+function ScreenVideo({ stream }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    if (ref.current) ref.current.srcObject = stream || null
+  }, [stream])
+  return <video ref={ref} className="screen-video" autoPlay playsInline muted />
+}
+
 export default function CallScreen({
-  call, people, localStream, media, facing, canFlip, notice, contacts,
-  onAccept, onHangup, onToggleMic, onToggleCam, onFlip, onInvite,
+  call, people, localStream, localScreen, media, facing, canFlip, notice, contacts,
+  onAccept, onHangup, onToggleMic, onToggleCam, onFlip, onInvite, onStartShare, onStopShare,
 }) {
   const [adding, setAdding] = useState(false)
+  const presRef = useRef(null)
 
   useEffect(() => {
     if (!call) setAdding(false)
@@ -70,8 +81,9 @@ export default function CallScreen({
 
   // ---------- in a call ----------
   const remote = Object.values(people)
+  const presenter = remote.find((p) => p.screen)
   const total = remote.length + 1
-  const pip = call.video && remote.length === 1
+  const pip = call.video && remote.length === 1 && !presenter
   const selfTile = (
     <Tile stream={localStream} name="You" camOn={media.cam} micOn={media.mic} muted mirror={facing === 'user'} />
   )
@@ -98,6 +110,22 @@ export default function CallScreen({
             <p>Calling...</p>
           </div>
         </>
+      ) : presenter ? (
+        <div className="present">
+          <div className="present-main" ref={presRef}>
+            <ScreenVideo stream={presenter.screen} />
+            <div className="tile-name">{presenter.name} is sharing their screen</div>
+            <button className="fs-btn" title="Full screen" onClick={() => presRef.current?.requestFullscreen?.()}>
+              <Icon name="expand" size={18} />
+            </button>
+          </div>
+          <div className="strip">
+            {remote.map((p) => (
+              <Tile key={p.id} stream={p.stream} name={p.name} camOn={p.cam} micOn={p.mic} />
+            ))}
+            {showSelfTile && selfTile}
+          </div>
+        </div>
       ) : (
         <div className={'tiles n' + Math.min(count, 5)}>
           {remote.map((p) => (
@@ -111,6 +139,14 @@ export default function CallScreen({
 
       <div className="call-top">{status}</div>
       {notice && <div className="call-notice">{notice}</div>}
+
+      {localScreen && (
+        <div className="share-banner">
+          <Icon name="monitor" size={16} />
+          You are sharing your screen
+          <button onClick={onStopShare}>Stop</button>
+        </div>
+      )}
 
       {adding && (
         <div className="add-panel">
@@ -142,6 +178,15 @@ export default function CallScreen({
         {call.video && canFlip && (
           <button className="call-btn" title="Switch camera" onClick={onFlip}>
             <Icon name="flip" size={26} />
+          </button>
+        )}
+        {canShareScreen && remote.length > 0 && (
+          <button
+            className={'call-btn' + (localScreen ? ' off' : '')}
+            title={localScreen ? 'Stop sharing' : 'Share your screen'}
+            onClick={localScreen ? onStopShare : onStartShare}
+          >
+            <Icon name="monitor" size={26} />
           </button>
         )}
         <button className="call-btn" title="Add people" disabled={total >= 5} onClick={() => setAdding((a) => !a)}>

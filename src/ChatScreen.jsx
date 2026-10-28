@@ -156,6 +156,7 @@ export default function ChatScreen({ session, keys }) {
   const {
     call, people, localStream, media, facing, canFlip, notice,
     startCall, acceptCall, hangup, toggleMic, toggleCam, flipCamera, inviteMore,
+    localScreen, startShare, stopShare,
   } = useCall(myId, myName, !!me?.is_official) // the official account never receives calls
   const { activity, sendActivity, clearActivity } = useActivity(myId)
 
@@ -1126,6 +1127,7 @@ export default function ChatScreen({ session, keys }) {
         canFlip={canFlip} notice={notice} contacts={callContacts}
         onAccept={acceptCall} onHangup={hangup} onToggleMic={toggleMic} onToggleCam={toggleCam}
         onFlip={flipCamera} onInvite={inviteMore}
+        localScreen={localScreen} onStartShare={startShare} onStopShare={stopShare}
       />
 
       {viewer !== null && mediaItems[viewer] && (

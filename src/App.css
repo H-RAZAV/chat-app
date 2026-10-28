@@ -354,3 +354,13 @@ body { overscroll-behavior: none; }
 .mini.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
 .name-edit { display: flex; gap: 8px; width: 100%; }
 .name-edit input { flex: 1; }
+/* ---------- Screen sharing ---------- */
+.present { position: absolute; inset: 0 0 104px 0; display: flex; flex-direction: column; gap: 4px; padding: 4px; }
+.present-main { position: relative; flex: 1; min-height: 0; background: #000; border-radius: 10px; overflow: hidden; }
+.screen-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+.fs-btn { position: absolute; right: 10px; bottom: 10px; width: 36px; height: 36px; border-radius: 50%; border: 0; background: rgba(0,0,0,.55); color: #fff; display: flex; align-items: center; justify-content: center; padding: 0; }
+.strip { display: flex; gap: 6px; height: 104px; flex-shrink: 0; overflow-x: auto; }
+.strip .tile { flex: 0 0 150px; }
+.strip .tile .big-avatar { width: 48px; height: 48px; font-size: 20px; }
+.share-banner { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 6; display: flex; align-items: center; gap: 8px; background: #d4a24c; color: #0c1525; padding: 6px 8px 6px 14px; border-radius: 18px; font-size: 13px; font-weight: 600; white-space: nowrap; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+.share-banner button { background: #0c1525; color: #fbf5ea; border: 0; border-radius: 12px; padding: 4px 12px; font-weight: 600; }

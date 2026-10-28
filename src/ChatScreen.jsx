@@ -8,6 +8,8 @@ import Settings from './Settings'
 import ProfileView from './ProfileView'
 import Appearance from './Appearance'
 import AdminPanel from './AdminPanel'
+import MessageMenu from './MessageMenu'
+import { NewGroup, GroupInfo } from './GroupDialogs'
 import { Name } from './Verified'
 import Icon from './Icon'
 import { useCall } from './useCall'
@@ -49,7 +51,9 @@ function lastSeenText(ts) {
   return 'last seen ' + new Date(ts).toLocaleDateString() + ' at ' + fmt(ts)
 }
 
-function previewText(m) {
+// ---------- message text ----------
+function previewText(m, myId) {
+  if (m.deleted_at) return m.sender_id === myId ? 'You deleted this message' : 'This message was deleted'
   if (m.locked) return "Message can't be decrypted"
   if (!m.file_path) return m.content
   const t = m.file_type || ''
@@ -59,35 +63,35 @@ function previewText(m) {
   return m.file_name
 }
 
-function preview(m) {
-  if (m.locked) {
-    return (
-      <span className="pv">
-        <Icon name="lock" size={14} />
-        {previewText(m)}
-      </span>
-    )
-  }
-  if (m.is_broadcast) {
-    return (
-      <span className="pv">
-        <Icon name="megaphone" size={14} />
-        {m.content}
-      </span>
-    )
-  }
+function preview(m, myId) {
+  const withIcon = (icon, label) => (
+    <span className="pv">
+      <Icon name={icon} size={14} />
+      {label}
+    </span>
+  )
+  if (m.deleted_at) return withIcon('ban', previewText(m, myId))
+  if (m.locked) return withIcon('lock', previewText(m, myId))
+  if (m.is_broadcast) return withIcon('megaphone', m.content)
   if (!m.file_path) return m.content
   const t = m.file_type || ''
   let icon = 'file'
   if (t.startsWith('audio/')) icon = 'mic'
   else if (t.startsWith('image/')) icon = 'image'
   else if (t.startsWith('video/')) icon = 'video'
-  return (
-    <span className="pv">
-      <Icon name={icon} size={14} />
-      {previewText(m)}
-    </span>
-  )
+  return withIcon(icon, previewText(m, myId))
+}
+
+// what a deleted message looks like
+const tomb = (m, ts) => ({
+  ...m, deleted_at: ts, content: '', enc: null, file_path: null, file_key: null, file_name: null,
+  file_type: null, file_size: null, duration: null, reply: null, locked: false,
+})
+
+const hue = (id) => {
+  let h = 0
+  for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360
+  return `hsl(${h} 55% 50%)`
 }
 
 const isMedia = (m) =>
@@ -109,11 +113,15 @@ export default function ChatScreen({ session, keys }) {
   const [me, setMe] = useState(null)
   const [official, setOfficial] = useState(null)
   const [messages, setMessages] = useState([])
+  const [hidden, setHidden] = useState(new Set())
+  const [groups, setGroups] = useState({})
   const [profiles, setProfiles] = useState({})
   const [active, setActive] = useState(null)
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
   const [text, setText] = useState('')
+  const [reply, setReply] = useState(null)
+  const [menu, setMenu] = useState(null)
   const [online, setOnline] = useState(new Set())
   const [recording, setRecording] = useState(false)
   const [secs, setSecs] = useState(0)
@@ -122,6 +130,7 @@ export default function ChatScreen({ session, keys }) {
   const [showAppearance, setShowAppearance] = useState(false)
   const [showAdmin, setShowAdmin] = useState(false)
   const [showProfile, setShowProfile] = useState(false)
+  const [showNewGroup, setShowNewGroup] = useState(false)
   const [viewer, setViewer] = useState(null)
   const [visible, setVisible] = useState(document.visibilityState === 'visible')
   const [perm, setPerm] = useState('Notification' in window ? Notification.permission : 'unsupported')
@@ -130,11 +139,17 @@ export default function ChatScreen({ session, keys }) {
   const recRef = useRef(null)
   const fileRef = useRef(null)
   const bottomRef = useRef(null)
+  const pressRef = useRef(null)
   const activeRef = useRef(null)
   activeRef.current = active
   const profilesRef = useRef({})
   profilesRef.current = profiles
+  const groupsRef = useRef({})
+  groupsRef.current = groups
+  const replyRef = useRef(null)
+  replyRef.current = reply
   const pairKeys = useRef({})
+  const selfKeyRef = useRef(null)
 
   const uploading = !!pending
   const myName = nameOf(me) || session.user.user_metadata?.username || 'someone'
@@ -143,6 +158,15 @@ export default function ChatScreen({ session, keys }) {
     startCall, acceptCall, hangup, toggleMic, toggleCam, flipCamera, inviteMore,
   } = useCall(myId, myName, !!me?.is_official) // the official account never receives calls
   const { activity, sendActivity, clearActivity } = useActivity(myId)
+
+  // typing and recording signals only exist in 1:1 chats
+  const ping = (to, kind) => {
+    if (to && !groupsRef.current[to]) sendActivity(to, kind)
+  }
+
+  // who is the other side of this message, and which chat does it belong to
+  const peerOf = (m) => (m.group_id ? m.sender_id : m.sender_id === myId ? m.receiver_id : m.sender_id)
+  const convOf = (m) => m.group_id || peerOf(m)
 
   async function logout() {
     try {
@@ -170,15 +194,25 @@ export default function ChatScreen({ session, keys }) {
     return pairKeys.current[id]
   }
 
+  // the key for the copy of a group message that is addressed to yourself
+  function getSelfKey() {
+    if (!selfKeyRef.current) selfKeyRef.current = derivePairKey(keys.priv, keys.pub, keys.pub)
+    return selfKeyRef.current
+  }
+
   // turns an encrypted row from the database into a readable message
   async function decryptMsg(m, profileMap) {
+    if (m.deleted_at) return tomb(m, m.deleted_at)
     if (!m.enc) return m // old message from before encryption
-    const otherId = m.sender_id === myId ? m.receiver_id : m.sender_id
     try {
-      const key = await getPairKey(profileMap[otherId])
+      const peer = peerOf(m)
+      const key = peer === myId ? await getSelfKey() : await getPairKey(profileMap[peer])
       if (!key) throw new Error('no key')
-      const data = await openJson(key, m.sender_id + '|' + m.receiver_id, m.enc)
-      const out = { ...m, content: data.t || '' }
+      const aad = m.group_id
+        ? `${m.sender_id}|${m.receiver_id}|${m.group_id}|${m.msg_uid}`
+        : `${m.sender_id}|${m.receiver_id}`
+      const data = await openJson(key, aad, m.enc)
+      const out = { ...m, content: data.t || '', reply: data.r || null }
       if (data.f) {
         out.file_name = data.f.n
         out.file_type = data.f.y
@@ -190,11 +224,6 @@ export default function ChatScreen({ session, keys }) {
     } catch {
       return { ...m, content: '', locked: true }
     }
-  }
-
-  async function encryptFor(to, obj) {
-    const key = await getPairKey(profilesRef.current[to])
-    return sealJson(key, myId + '|' + to, obj)
   }
 
   // make sure the other person has set up encryption
@@ -215,19 +244,81 @@ export default function ChatScreen({ session, keys }) {
     return true
   }
 
+  // encrypts one message and stores it. Groups get one separately encrypted copy per member.
+  async function deliver(to, payload, extra = {}) {
+    if (groupsRef.current[to]) {
+      const { data: mem } = await supabase.from('group_members').select('user_id').eq('group_id', to)
+      const ids = (mem || []).map((x) => x.user_id)
+      const missing = ids.filter((id) => id !== myId && !profilesRef.current[id]?.public_key)
+      if (missing.length) {
+        const { data } = await supabase.from('profiles').select('*').in('id', missing)
+        ;(data || []).forEach((p) => (profilesRef.current[p.id] = p))
+        addProfiles(data || [])
+      }
+      const uid = crypto.randomUUID()
+      const now = new Date().toISOString()
+      const rows = []
+      for (const id of ids) {
+        const key = id === myId ? await getSelfKey() : await getPairKey(profilesRef.current[id])
+        if (!key) continue
+        const enc = await sealJson(key, `${myId}|${id}|${to}|${uid}`, payload)
+        rows.push({
+          receiver_id: id, group_id: to, msg_uid: uid, content: '', enc, ...extra,
+          ...(id === myId ? { read_at: now, delivered_at: now } : {}),
+        })
+      }
+      if (rows.length < 2) throw new Error('Nobody else in this group has set up encryption yet.')
+      const { data, error } = await supabase.from('messages').insert(rows).select()
+      if (error) throw error
+      return data.find((r) => r.receiver_id === myId)
+    }
+    const key = await getPairKey(profilesRef.current[to])
+    const enc = await sealJson(key, `${myId}|${to}`, payload)
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({ receiver_id: to, content: '', enc, ...extra })
+      .select()
+      .single()
+    if (error) throw error
+    return data
+  }
+
   function markDelivered() {
     supabase.rpc('mark_delivered').then(() => {})
   }
 
+  async function loadGroups() {
+    const { data: gs } = await supabase.from('groups').select('*')
+    if (!gs) return
+    const map = {}
+    gs.forEach((g) => (map[g.id] = { ...g, members: [] }))
+    let members = []
+    if (gs.length) {
+      const { data } = await supabase.from('group_members').select('*').in('group_id', gs.map((g) => g.id))
+      members = data || []
+    }
+    members.forEach((m) => map[m.group_id]?.members.push({ user_id: m.user_id, role: m.role, joined_at: m.joined_at }))
+    const need = [...new Set(members.map((m) => m.user_id))].filter((id) => !profilesRef.current[id])
+    if (need.length) {
+      const { data: ps } = await supabase.from('profiles').select('*').in('id', need)
+      ;(ps || []).forEach((p) => (profilesRef.current[p.id] = p))
+      addProfiles(ps || [])
+    }
+    setGroups(map)
+  }
+
   async function fetchMessages() {
-    const { data: msgs } = await supabase
-      .from('messages').select('*')
-      // announcements you sent are not shown in your own chat list
-      .or(`is_broadcast.eq.false,sender_id.neq.${myId}`)
-      .order('created_at', { ascending: false }).limit(1000)
+    const [{ data: msgs }, { data: hid }] = await Promise.all([
+      supabase.from('messages').select('*')
+        // announcements you sent are not shown in your own chat list
+        .or(`is_broadcast.eq.false,sender_id.neq.${myId}`)
+        .order('created_at', { ascending: false }).limit(1000),
+      supabase.from('hidden_messages').select('message_id'),
+    ])
+    setHidden(new Set((hid || []).map((h) => h.message_id)))
     const raw = (msgs || []).reverse()
     const map = { ...profilesRef.current }
-    const ids = [...new Set(raw.map((m) => (m.sender_id === myId ? m.receiver_id : m.sender_id)))]
+    const ids = [...new Set(raw.map(peerOf).filter((id) => id && id !== myId))]
     if (ids.length) {
       const { data: ps } = await supabase.from('profiles').select('*').in('id', ids)
       ;(ps || []).forEach((p) => (map[p.id] = p))
@@ -257,41 +348,51 @@ export default function ChatScreen({ session, keys }) {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
         const raw = payload.new
         if (raw.is_broadcast && raw.sender_id === myId) return // our own announcement copies
+        if (raw.group_id && raw.receiver_id !== myId) return
 
-        const incoming = raw.receiver_id === myId
+        const incoming = raw.receiver_id === myId && raw.sender_id !== myId
+        const convId = raw.group_id || (incoming ? raw.sender_id : raw.receiver_id)
         const screenHidden = document.visibilityState !== 'visible'
-        const viewing = !screenHidden && activeRef.current === raw.sender_id
+        const viewing = !screenHidden && activeRef.current === convId
         if (incoming) {
           markDelivered()
-          clearActivity(raw.sender_id)
+          if (!raw.group_id) clearActivity(raw.sender_id)
           if (!viewing) playPing()
         }
 
-        const otherId = incoming ? raw.sender_id : raw.receiver_id
-        let p = profilesRef.current[otherId]
-        if (!p || !p.public_key) {
-          const { data } = await supabase.from('profiles').select('*').eq('id', otherId).single()
+        const peerId = peerOf(raw)
+        let p = peerId === myId ? null : profilesRef.current[peerId]
+        if (peerId !== myId && (!p || !p.public_key)) {
+          const { data } = await supabase.from('profiles').select('*').eq('id', peerId).single()
           if (data) {
             p = data
-            profilesRef.current[otherId] = data
+            profilesRef.current[peerId] = data
             addProfiles([data])
           }
         }
 
-        const m = await decryptMsg(raw, { [otherId]: p })
+        const m = await decryptMsg(raw, { [peerId]: p })
         setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
 
         if (incoming && screenHidden) {
-          showNotification(nameOf(p) || 'Veil', previewText(m), 'msg-' + raw.sender_id, {
-            from: raw.sender_id,
-          })
+          const g = groupsRef.current[raw.group_id]
+          showNotification(
+            g ? g.name : nameOf(p) || 'Veil',
+            g ? nameOf(p) + ': ' + previewText(m, myId) : previewText(m, myId),
+            'msg-' + convId,
+            { from: convId }
+          )
         }
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, (payload) => {
         const n = payload.new
-        // only the ticks change; never overwrite the decrypted text
         setMessages((prev) =>
-          prev.map((m) => (m.id === n.id ? { ...m, read_at: n.read_at, delivered_at: n.delivered_at } : m))
+          prev.map((m) => {
+            if (m.id !== n.id) return m
+            if (n.deleted_at) return tomb(m, n.deleted_at) // deleted for everyone
+            // only the ticks change; never overwrite the decrypted text
+            return { ...m, read_at: n.read_at, delivered_at: n.delivered_at }
+          })
         )
       })
       .subscribe()
@@ -300,9 +401,15 @@ export default function ChatScreen({ session, keys }) {
     const onVis = () => {
       const v = document.visibilityState === 'visible'
       setVisible(v)
-      if (v) fetchMessages()
+      if (v) {
+        fetchMessages()
+        loadGroups()
+      }
     }
-    const onNet = () => fetchMessages()
+    const onNet = () => {
+      fetchMessages()
+      loadGroups()
+    }
     document.addEventListener('visibilitychange', onVis)
     window.addEventListener('online', onNet)
 
@@ -311,6 +418,17 @@ export default function ChatScreen({ session, keys }) {
       window.removeEventListener('online', onNet)
       supabase.removeChannel(channel)
     }
+  }, [myId])
+
+  // groups: load them, and reload when you are added or removed
+  useEffect(() => {
+    loadGroups()
+    const ch = supabase
+      .channel('my-groups')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'group_members' }, () => loadGroups())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, () => loadGroups())
+      .subscribe()
+    return () => supabase.removeChannel(ch)
   }, [myId])
 
   // sound needs one tap on the page before browsers allow it
@@ -334,14 +452,20 @@ export default function ChatScreen({ session, keys }) {
     return () => navigator.serviceWorker?.removeEventListener('message', onMsg)
   }, [])
 
-  // unread counts per person
+  // messages you hid for yourself are never shown
+  const shown = useMemo(() => messages.filter((m) => !hidden.has(m.id)), [messages, hidden])
+
+  // unread counts per chat (a person, or a group)
   const unread = useMemo(() => {
     const c = {}
-    messages.forEach((m) => {
-      if (m.receiver_id === myId && !m.read_at) c[m.sender_id] = (c[m.sender_id] || 0) + 1
+    shown.forEach((m) => {
+      if (m.receiver_id === myId && m.sender_id !== myId && !m.read_at && !m.deleted_at) {
+        const k = m.group_id || m.sender_id
+        c[k] = (c[k] || 0) + 1
+      }
     })
     return c
-  }, [messages, myId])
+  }, [shown, myId])
   const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0)
   const activeUnread = unread[active] || 0
 
@@ -354,18 +478,26 @@ export default function ChatScreen({ session, keys }) {
   // messages in the open chat count as read while the app is on screen
   useEffect(() => {
     if (!active || !visible || !activeUnread) return
-    supabase.rpc('mark_read', { other: active }).then(({ error }) => {
-      if (error) return
-      const now = new Date().toISOString()
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.sender_id === active && m.receiver_id === myId && !m.read_at
-            ? { ...m, read_at: now, delivered_at: m.delivered_at || now }
-            : m
+    const isGroup = !!groupsRef.current[active]
+    supabase
+      .rpc(isGroup ? 'mark_group_read' : 'mark_read', isGroup ? { gid: active } : { other: active })
+      .then(({ error }) => {
+        if (error) return
+        const now = new Date().toISOString()
+        setMessages((prev) =>
+          prev.map((m) =>
+            convOf(m) === active && m.receiver_id === myId && m.sender_id !== myId && !m.read_at
+              ? { ...m, read_at: now, delivered_at: m.delivered_at || now }
+              : m
+          )
         )
-      )
-    })
+      })
   }, [active, visible, activeUnread, myId])
+
+  // a reply belongs to one chat
+  useEffect(() => {
+    setReply(null)
+  }, [active])
 
   // online status (presence) + last seen
   useEffect(() => {
@@ -403,7 +535,7 @@ export default function ChatScreen({ session, keys }) {
 
   // refresh the open person's profile (fresh last seen, photo, about, ticks)
   useEffect(() => {
-    if (!active) return
+    if (!active || groupsRef.current[active]) return
     supabase.from('profiles').select('*').eq('id', active).single()
       .then(({ data }) => { if (data) addProfiles([data]) })
   }, [active])
@@ -426,26 +558,26 @@ export default function ChatScreen({ session, keys }) {
     return () => clearTimeout(t)
   }, [query, myId])
 
-  // chat list: latest message per person
-  const conversations = useMemo(() => {
-    const map = {}
-    messages.forEach((m) => {
-      const other = m.sender_id === myId ? m.receiver_id : m.sender_id
-      map[other] = m
-    })
-    return Object.entries(map)
-      .map(([id, last]) => ({ id, last }))
-      .sort((a, b) => new Date(b.last.created_at) - new Date(a.last.created_at))
-  }, [messages, myId])
-
-  // the official Veil account is always pinned at the top for everyone else
+  // chat list: latest message per person or group, groups without messages, official account pinned
   const chatList = useMemo(() => {
-    if (!official || official.id === myId) return conversations
-    const own = conversations.find((c) => c.id === official.id)
-    return [own || { id: official.id, last: null }, ...conversations.filter((c) => c.id !== official.id)]
-  }, [conversations, official, myId])
+    const map = {}
+    shown.forEach((m) => {
+      if (m.group_id && !groups[m.group_id]) return // groups you have left
+      map[convOf(m)] = m
+    })
+    const list = Object.entries(map).map(([id, last]) => ({ id, last, ts: last.created_at }))
+    Object.values(groups).forEach((g) => {
+      if (!map[g.id]) list.push({ id: g.id, last: null, ts: g.created_at })
+    })
+    list.sort((a, b) => new Date(b.ts) - new Date(a.ts))
+    if (official && official.id !== myId) {
+      const own = list.find((c) => c.id === official.id)
+      return [own || { id: official.id, last: null, ts: 0 }, ...list.filter((c) => c.id !== official.id)]
+    }
+    return list
+  }, [shown, groups, official, myId])
 
-  const chatMessages = messages.filter((m) => m.sender_id === active || m.receiver_id === active)
+  const chatMessages = shown.filter((m) => convOf(m) === active)
   const mediaItems = chatMessages.filter(isMedia)
 
   useEffect(() => {
@@ -477,10 +609,57 @@ export default function ChatScreen({ session, keys }) {
     setQuery('')
   }
 
+  // ---------- reply, copy, delete ----------
+  function startPress(m) {
+    clearTimeout(pressRef.current)
+    pressRef.current = setTimeout(() => setMenu(m), 500)
+  }
+  const endPress = () => clearTimeout(pressRef.current)
+
+  function startReply(m) {
+    setReply({
+      u: m.msg_uid,
+      n: m.sender_id === myId ? myName : nameOf(profiles[m.sender_id]),
+      x: String(previewText(m, myId) || '').slice(0, 120),
+    })
+    setMenu(null)
+  }
+
+  function jumpTo(uid) {
+    const el = document.querySelector(`[data-uid="${uid}"]`)
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.classList.add('flash')
+    setTimeout(() => el.classList.remove('flash'), 1300)
+  }
+
+  async function deleteForMe(m) {
+    setMenu(null)
+    const { error } = await supabase.from('hidden_messages').insert({ message_id: m.id })
+    if (error && !/duplicate/i.test(error.message)) return alert(error.message)
+    setHidden((h) => new Set(h).add(m.id))
+  }
+
+  async function deleteForAll(m) {
+    setMenu(null)
+    if (!window.confirm('Delete this message for everyone?')) return
+    const { data: paths, error } = await supabase.rpc('delete_for_everyone', { target: m.msg_uid })
+    if (error) return alert(error.message)
+    if (paths && paths.length) supabase.storage.from('chat-files').remove(paths)
+    const now = new Date().toISOString()
+    setMessages((prev) => prev.map((x) => (x.msg_uid === m.msg_uid && x.sender_id === myId ? tomb(x, now) : x)))
+  }
+
+  function copyText(m) {
+    setMenu(null)
+    navigator.clipboard?.writeText(m.content)
+  }
+
+  // ---------- sending ----------
   function onType(e) {
     const v = e.target.value
     setText(v)
-    if (active) sendActivity(active, v.trim() ? 'typing' : 'none')
+    if (active) ping(active, v.trim() ? 'typing' : 'none')
   }
 
   async function send(e) {
@@ -488,22 +667,19 @@ export default function ChatScreen({ session, keys }) {
     const content = text.trim()
     if (!content || !active) return
     const to = active
-    if (!(await ensurePeerKey(to))) return
+    if (!groupsRef.current[to] && !(await ensurePeerKey(to))) return
+    const rep = reply
     setText('')
-    sendActivity(to, 'none')
+    setReply(null)
+    ping(to, 'none')
     try {
-      const encrypted = await encryptFor(to, { t: content })
-      const { data, error } = await supabase
-        .from('messages')
-        .insert({ receiver_id: to, content: '', enc: encrypted })
-        .select()
-        .single()
-      if (error) throw error
-      const m = { ...data, content }
+      const row = await deliver(to, { t: content, ...(rep ? { r: rep } : {}) })
+      const m = { ...row, content, reply: rep || null }
       setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
     } catch (err) {
       alert(err.message || 'Could not send the message.')
       setText(content)
+      setReply(rep)
     }
   }
 
@@ -514,7 +690,9 @@ export default function ChatScreen({ session, keys }) {
       alert('File is too big. Maximum is 25 MB.')
       return
     }
-    if (!(await ensurePeerKey(to))) return
+    if (!groupsRef.current[to] && !(await ensurePeerKey(to))) return
+    const rep = replyRef.current
+    setReply(null)
     setPending({ to, name, voice: type.startsWith('audio/') && name.startsWith('voice-') })
     try {
       const sealed = await sealBytes(await file.arrayBuffer())
@@ -526,27 +704,20 @@ export default function ChatScreen({ session, keys }) {
         alert(upErr.message)
         return
       }
-      const encrypted = await encryptFor(to, {
-        t: '',
-        f: { n: name, y: type, s: file.size, d: duration || null, k: sealed.key },
-      })
-      const { data, error } = await supabase
-        .from('messages')
-        .insert({ receiver_id: to, content: '', enc: encrypted, file_path: path })
-        .select()
-        .single()
-      if (error) {
-        alert(error.message)
-        return
-      }
+      const row = await deliver(
+        to,
+        { t: '', f: { n: name, y: type, s: file.size, d: duration || null, k: sealed.key }, ...(rep ? { r: rep } : {}) },
+        { file_path: path }
+      )
       const m = {
-        ...data,
+        ...row,
         content: '',
         file_name: name,
         file_type: type,
         file_size: file.size,
         duration: duration || null,
         file_key: sealed.key,
+        reply: rep || null,
       }
       setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]))
     } catch (err) {
@@ -583,7 +754,7 @@ export default function ChatScreen({ session, keys }) {
         stream.getTracks().forEach((t) => t.stop())
         clearInterval(r.timer)
         clearInterval(r.act)
-        sendActivity(to, 'none')
+        ping(to, 'none')
         setRecording(false)
         if (r.cancelled) return
         const type = (recorder.mimeType || 'audio/webm').split(';')[0]
@@ -597,8 +768,8 @@ export default function ChatScreen({ session, keys }) {
       recorder.start()
       setSecs(0)
       r.timer = setInterval(() => setSecs((s) => s + 1), 1000)
-      sendActivity(to, 'recording')
-      r.act = setInterval(() => sendActivity(to, 'recording'), 2000)
+      ping(to, 'recording')
+      r.act = setInterval(() => ping(to, 'recording'), 2000)
       recRef.current = r
       setRecording(true)
     } catch {
@@ -613,9 +784,33 @@ export default function ChatScreen({ session, keys }) {
     r.recorder.stop()
   }
 
+  // ---------- groups ----------
+  async function createGroup(name, ids) {
+    const { data, error } = await supabase.rpc('create_group', { group_name: name, member_ids: ids })
+    if (error) throw error
+    await loadGroups()
+    setShowNewGroup(false)
+    setActive(data)
+  }
+
+  async function groupCall(fn, args) {
+    const { error } = await supabase.rpc(fn, args)
+    if (error) throw error
+    await loadGroups()
+  }
+
+  async function leaveGroup() {
+    if (!window.confirm('Leave this group? You will keep your old messages, but get no new ones.')) return
+    const { error } = await supabase.rpc('leave_group', { gid: active })
+    if (error) return alert(error.message)
+    setShowProfile(false)
+    setActive(null)
+    await loadGroups()
+  }
+
   // privacy: a person who hides their status shows no dot / last seen
-  const hidden = (id) => !!profiles[id]?.hide_last_seen
-  const showOnline = (id) => online.has(id) && !hidden(id)
+  const hiddenStatus = (id) => !!profiles[id]?.hide_last_seen
+  const showOnline = (id) => online.has(id) && !hiddenStatus(id)
 
   // calls (still work even if the person hides their status)
   function callPeer(video) {
@@ -626,21 +821,43 @@ export default function ChatScreen({ session, keys }) {
     startCall([{ id: active, username: activeName }], video)
   }
 
+  // a group call invites up to 4 of the members who are online
+  function callGroup(video) {
+    const list = (activeGroup?.members || [])
+      .filter((x) => x.user_id !== myId && online.has(x.user_id))
+      .slice(0, 4)
+      .map((x) => ({ id: x.user_id, username: nameOf(profiles[x.user_id]) }))
+    if (!list.length) {
+      alert('Nobody else in this group has Veil open right now. Calls only ring people who are online.')
+      return
+    }
+    startCall(list, video)
+  }
+
   // people you can add to a call: your chats who are online right now
-  const callContacts = conversations
-    .filter(({ id }) => online.has(id) && profiles[id] && !profiles[id].is_official)
+  const callContacts = chatList
+    .filter(({ id }) => !groups[id] && online.has(id) && profiles[id] && !profiles[id].is_official)
     .map(({ id }) => ({ id, username: nameOf(profiles[id]), profile: profiles[id] }))
 
-  const activeName = nameOf(profiles[active])
-  const peerIsOfficial = !!profiles[active]?.is_official
-  const statusText = peerIsOfficial
+  // people you can put in a group: your 1:1 chats
+  const groupCandidates = chatList
+    .filter((c) => !groups[c.id])
+    .map((c) => profiles[c.id])
+    .filter((p) => p && !p.is_official)
+
+  const activeGroup = groups[active] || null
+  const activeName = activeGroup ? activeGroup.name : nameOf(profiles[active])
+  const peerIsOfficial = !activeGroup && !!profiles[active]?.is_official
+  const statusText = activeGroup
+    ? activeGroup.members.map((x) => (x.user_id === myId ? 'You' : nameOf(profiles[x.user_id]))).join(', ')
+    : peerIsOfficial
     ? 'Official account'
-    : hidden(active)
+    : hiddenStatus(active)
     ? ''
     : online.has(active)
     ? 'online'
     : lastSeenText(profiles[active]?.last_seen)
-  const act = activity[active]
+  const act = activeGroup ? null : activity[active]
 
   return (
     <div className={'app' + (active ? ' chat-open' : '')}>
@@ -656,6 +873,9 @@ export default function ChatScreen({ session, keys }) {
               <Icon name="shield" size={21} />
             </button>
           )}
+          <button className="icon-btn" title="New group" onClick={() => setShowNewGroup(true)}>
+            <Icon name="users" size={21} />
+          </button>
           <button className="icon-btn" title="Appearance" onClick={() => setShowAppearance(true)}>
             <Icon name="palette" size={21} />
           </button>
@@ -696,25 +916,33 @@ export default function ChatScreen({ session, keys }) {
             )
           ) : chatList.length ? (
             chatList.map(({ id, last }) => {
-              const isOfficial = official && id === official.id && official.id !== myId
+              const g = groups[id]
+              const isOfficial = !g && official && id === official.id && official.id !== myId
+              const who = last && g && last.sender_id !== myId ? nameOf(profiles[last.sender_id]) + ': ' : ''
               return (
                 <div key={id} className={'item' + (id === active ? ' active' : '') + (isOfficial ? ' pinned' : '')}
                      onClick={() => setActive(id)}>
-                  <Avatar profile={profiles[id]} online={showOnline(id) && !isOfficial} />
+                  <Avatar profile={g ? { display_name: g.name } : profiles[id]}
+                          online={!g && showOnline(id) && !isOfficial} />
                   <div className="meta">
                     <div className="top">
-                      <span className="name"><Name p={profiles[id]} /></span>
+                      <span className="name">
+                        {g ? <span className="nm"><span className="txt">{g.name}</span></span> : <Name p={profiles[id]} />}
+                      </span>
                       {last && <span className={'time' + (unread[id] ? ' new' : '')}>{listTime(last.created_at)}</span>}
                     </div>
                     <div className="row2">
-                      <div className={'last' + (activity[id] ? ' act' : '')}>
-                        {activity[id] ? (
+                      <div className={'last' + (!g && activity[id] ? ' act' : '')}>
+                        {!g && activity[id] ? (
                           actText(activity[id])
                         ) : last ? (
                           <>
-                            {last.sender_id === myId && <Ticks m={last} size={15} />}
-                            {preview(last)}
+                            {last.sender_id === myId && !g && !last.deleted_at && <Ticks m={last} size={15} />}
+                            {who}
+                            {preview(last, myId)}
                           </>
+                        ) : g ? (
+                          'Group created. Say hello!'
                         ) : (
                           'Support and updates. Message us anytime.'
                         )}
@@ -739,19 +967,22 @@ export default function ChatScreen({ session, keys }) {
               <button className="back" onClick={() => setActive(null)}>
                 <Icon name="back" size={22} />
               </button>
-              <div className="head-click" title="View contact info and security code" onClick={() => setShowProfile(true)}>
-                <Avatar profile={profiles[active]} online={showOnline(active) && !peerIsOfficial} />
+              <div className="head-click" title="View info" onClick={() => setShowProfile(true)}>
+                <Avatar profile={activeGroup ? { display_name: activeGroup.name } : profiles[active]}
+                        online={!activeGroup && showOnline(active) && !peerIsOfficial} />
                 <div className="who">
-                  <b><Name p={profiles[active]} /></b>
+                  <b>{activeGroup ? activeGroup.name : <Name p={profiles[active]} />}</b>
                   <small className={act ? 'act' : ''}>{act ? actText(act) : statusText}</small>
                 </div>
               </div>
               {!peerIsOfficial && (
                 <>
-                  <button className="icon-btn" title="Video call" onClick={() => callPeer(true)}>
+                  <button className="icon-btn" title="Video call"
+                          onClick={() => (activeGroup ? callGroup(true) : callPeer(true))}>
                     <Icon name="video" size={22} />
                   </button>
-                  <button className="icon-btn" title="Voice call" onClick={() => callPeer(false)}>
+                  <button className="icon-btn" title="Voice call"
+                          onClick={() => (activeGroup ? callGroup(false) : callPeer(false))}>
                     <Icon name="phone" size={20} />
                   </button>
                 </>
@@ -762,33 +993,68 @@ export default function ChatScreen({ session, keys }) {
               <div className="enc-note">
                 <Icon name="lock" size={13} />
                 <span>
-                  Messages and files in this chat are end-to-end encrypted. Tap the name above to check the security code.
+                  {activeGroup
+                    ? 'Messages in this group are end-to-end encrypted. Each message is encrypted separately for every member.'
+                    : 'Messages and files in this chat are end-to-end encrypted. Tap the name above to check the security code.'}
                 </span>
               </div>
-              {chatMessages.map((m, i) => (
-                <Fragment key={m.id}>
-                  {(i === 0 || !sameDay(chatMessages[i - 1].created_at, m.created_at)) && (
-                    <div className="day-sep"><span>{dayLabel(m.created_at)}</span></div>
-                  )}
-                  <div className={'bubble ' + (m.sender_id === myId ? 'me' : 'them')}>
-                    {m.locked ? (
-                      <span className="locked"><Icon name="lock" size={13} /> Can't decrypt this message</span>
-                    ) : (
-                      <>
-                        {m.is_broadcast && (
-                          <div className="bcast"><Icon name="megaphone" size={13} /> Announcement</div>
-                        )}
-                        {m.file_path && <Attachment m={m} onOpen={() => openViewer(m)} />}
-                        {m.content}
-                      </>
+              {chatMessages.map((m, i) => {
+                const mine = m.sender_id === myId
+                return (
+                  <Fragment key={m.id}>
+                    {(i === 0 || !sameDay(chatMessages[i - 1].created_at, m.created_at)) && (
+                      <div className="day-sep"><span>{dayLabel(m.created_at)}</span></div>
                     )}
-                    <span className="t">
-                      {fmt(m.created_at)}
-                      {m.sender_id === myId && <Ticks m={m} />}
-                    </span>
-                  </div>
-                </Fragment>
-              ))}
+                    <div
+                      className={'bubble ' + (mine ? 'me' : 'them')}
+                      data-uid={m.msg_uid}
+                      onContextMenu={(e) => { e.preventDefault(); setMenu(m) }}
+                      onTouchStart={() => startPress(m)}
+                      onTouchEnd={endPress}
+                      onTouchMove={endPress}
+                    >
+                      {m.deleted_at ? (
+                        <span className="gone">
+                          <Icon name="ban" size={13} />
+                          {mine ? 'You deleted this message' : 'This message was deleted'}
+                        </span>
+                      ) : (
+                        <>
+                          <button className="bub-menu" title="Message options" onClick={() => setMenu(m)}>
+                            <Icon name="chevron" size={16} />
+                          </button>
+                          {activeGroup && !mine && (
+                            <div className="sender" style={{ color: hue(m.sender_id) }}>
+                              {nameOf(profiles[m.sender_id])}
+                            </div>
+                          )}
+                          {m.reply && (
+                            <div className="quote" onClick={() => jumpTo(m.reply.u)}>
+                              <b>{m.reply.n}</b>
+                              <span>{m.reply.x}</span>
+                            </div>
+                          )}
+                          {m.locked ? (
+                            <span className="locked"><Icon name="lock" size={13} /> Can't decrypt this message</span>
+                          ) : (
+                            <>
+                              {m.is_broadcast && (
+                                <div className="bcast"><Icon name="megaphone" size={13} /> Announcement</div>
+                              )}
+                              {m.file_path && <Attachment m={m} onOpen={() => openViewer(m)} />}
+                              {m.content}
+                            </>
+                          )}
+                        </>
+                      )}
+                      <span className="t">
+                        {fmt(m.created_at)}
+                        {mine && !m.group_id && !m.deleted_at && <Ticks m={m} />}
+                      </span>
+                    </div>
+                  </Fragment>
+                )
+              })}
               {pending && pending.to === active && (
                 <div className="bubble me sending">
                   <span className="dots"><i /><i /><i /></span>
@@ -797,6 +1063,18 @@ export default function ChatScreen({ session, keys }) {
               )}
               <div ref={bottomRef} />
             </div>
+
+            {reply && !recording && (
+              <div className="reply-bar">
+                <div className="quote">
+                  <b>Replying to {reply.n}</b>
+                  <span>{reply.x}</span>
+                </div>
+                <button title="Cancel reply" onClick={() => setReply(null)}>
+                  <Icon name="close" size={18} />
+                </button>
+              </div>
+            )}
 
             {recording ? (
               <div className="composer">
@@ -860,6 +1138,18 @@ export default function ChatScreen({ session, keys }) {
         />
       )}
 
+      {menu && (
+        <MessageMenu
+          m={menu}
+          mine={menu.sender_id === myId}
+          onReply={() => startReply(menu)}
+          onCopy={() => copyText(menu)}
+          onDeleteMe={() => deleteForMe(menu)}
+          onDeleteAll={() => deleteForAll(menu)}
+          onClose={() => setMenu(null)}
+        />
+      )}
+
       {showSettings && me && (
         <Settings me={me} onClose={() => setShowSettings(false)} onSaved={(p) => setMe(p)} />
       )}
@@ -875,14 +1165,32 @@ export default function ChatScreen({ session, keys }) {
         />
       )}
 
-      {showProfile && active && profiles[active] && (
-        <ProfileView
-          profile={profiles[active]}
-          status={statusText}
-          myKey={keys.pub}
-          onClose={() => setShowProfile(false)}
-        />
+      {showNewGroup && (
+        <NewGroup contacts={groupCandidates} onClose={() => setShowNewGroup(false)} onCreate={createGroup} />
       )}
+
+      {showProfile && active && (activeGroup ? (
+        <GroupInfo
+          group={activeGroup}
+          profiles={profiles}
+          myId={myId}
+          contacts={groupCandidates}
+          onClose={() => setShowProfile(false)}
+          onRename={(name) => groupCall('group_rename', { gid: active, new_name: name })}
+          onAdd={(ids) => groupCall('group_add_members', { gid: active, member_ids: ids })}
+          onRemove={(id) => groupCall('group_remove_member', { gid: active, target: id })}
+          onLeave={leaveGroup}
+        />
+      ) : (
+        profiles[active] && (
+          <ProfileView
+            profile={profiles[active]}
+            status={statusText}
+            myKey={keys.pub}
+            onClose={() => setShowProfile(false)}
+          />
+        )
+      ))}
     </div>
   )
 }

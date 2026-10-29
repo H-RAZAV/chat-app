@@ -1,0 +1,9 @@
+{
+  "appId": "com.veilchat.app",
+  "appName": "Veil",
+  "webDir": "dist",
+  "server": {
+    "url": "https://base2-orcin.vercel.app",
+    "androidScheme": "https"
+  }
+}

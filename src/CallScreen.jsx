@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import Icon from './Icon'
 import Avatar from './Avatar'
 import { canShareScreen } from './useCall'
+import { startRingtone, startRingback, stopRing, playEnd } from './sounds'
 
 function Tile({ stream, name, camOn, micOn, muted, mirror }) {
   const ref = useRef(null)
@@ -51,6 +52,23 @@ export default function CallScreen({
   useEffect(() => {
     if (!call) setAdding(false)
   }, [call])
+
+  // ringing sounds
+  const status0 = call?.status
+  const callerSide = !!call && !call.inviterId
+  const peerCount = Object.keys(people).length
+  const hadCall = useRef(false)
+  useEffect(() => {
+    if (status0 === 'incoming') startRingtone()
+    else if (status0 === 'calling' && callerSide && peerCount === 0) startRingback()
+    else stopRing()
+    if (call) hadCall.current = true
+    else if (hadCall.current) {
+      hadCall.current = false
+      playEnd()
+    }
+  }, [status0, callerSide, peerCount, !!call])
+  useEffect(() => stopRing, [])
 
   if (!call) return null
 

@@ -1,3 +1,39 @@
+import { supabase } from './supabaseClient'
+
+const VAPID_PUBLIC_KEY = 'BB7ED6M2snpVJUW7F6AiSWIBkZzPnj4gu0Co09_fdtv5NZm5YG-EmKwM25XTT-MMJT5bJ2aDNgS37EmNwP1PDwg'
+
+function urlBase64ToUint8Array(base64) {
+  const padding = '='.repeat((4 - (base64.length % 4)) % 4)
+  const base64Safe = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/')
+  const raw = atob(base64Safe)
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)))
+}
+
+export async function enablePush(userId) {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return
+  const reg = await navigator.serviceWorker.register('/push-sw.js')
+  const perm = await Notification.requestPermission()
+  if (perm !== 'granted') return
+  let sub = await reg.pushManager.getSubscription()
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    })
+  }
+  const raw = sub.toJSON()
+  await supabase.from('push_subscriptions').upsert(
+    {
+      user_id: userId,
+      endpoint: raw.endpoint,
+      p256dh: raw.keys.p256dh,
+      auth_key: raw.keys.auth,
+    },
+    { onConflict: 'endpoint' }
+  )
+}
+
+
 let ctx = null
 
 // browsers only allow sound after the person has tapped something once

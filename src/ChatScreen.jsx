@@ -15,6 +15,7 @@ import Icon from './Icon'
 import { useCall } from './useCall'
 import { useActivity } from './useActivity'
 import { playPing, unlockAudio, setBadge, showNotification } from './notify'
+import { playReceive, playSend } from './sounds'
 import { derivePairKey, sealJson, openJson, sealBytes, clearKey } from './crypto'
 
 const MAX_SIZE = 25 * 1024 * 1024 - 1024 // a little room for the encryption overhead
@@ -335,6 +336,7 @@ export default function ChatScreen({ session, keys }) {
     async function load() {
       const { data: mine } = await supabase.from('profiles').select('*').eq('id', myId).single()
       setMe(mine)
+            import('./notify').then((m) => m.enablePush?.(myId))
       const { data: off } = await supabase.from('profiles').select('*').eq('is_official', true).limit(1).maybeSingle()
       if (off) {
         setOfficial(off)
@@ -352,13 +354,14 @@ export default function ChatScreen({ session, keys }) {
         if (raw.group_id && raw.receiver_id !== myId) return
 
         const incoming = raw.receiver_id === myId && raw.sender_id !== myId
+        if (!incoming && raw.sender_id === myId && !raw.deleted_at) playSend()
         const convId = raw.group_id || (incoming ? raw.sender_id : raw.receiver_id)
         const screenHidden = document.visibilityState !== 'visible'
         const viewing = !screenHidden && activeRef.current === convId
         if (incoming) {
           markDelivered()
           if (!raw.group_id) clearActivity(raw.sender_id)
-          if (!viewing) playPing()
+          playReceive()
         }
 
         const peerId = peerOf(raw)
